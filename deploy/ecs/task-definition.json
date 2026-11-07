@@ -1,0 +1,59 @@
+{
+  "family": "atrium",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": { "cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX" },
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/<ECS_TASK_EXECUTION_ROLE>",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/atrium-task",
+  "containerDefinitions": [
+    {
+      "name": "atrium",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/atrium:<TAG>",
+      "essential": true,
+      "stopTimeout": 30,
+      "portMappings": [{ "containerPort": 3100, "protocol": "tcp", "name": "http" }],
+      "environment": [
+        { "name": "PORT", "value": "3100" },
+        { "name": "PUBLIC_URL", "value": "https://atrium.<DOMAIN>" },
+        { "name": "LOG_LEVEL", "value": "info" },
+        { "name": "COOKIE_SECURE", "value": "true" },
+        { "name": "DB_HOST", "value": "<RDS_ENDPOINT>" },
+        { "name": "DB_PORT", "value": "5432" },
+        { "name": "DB_NAME", "value": "atrium" },
+        { "name": "DB_USER", "value": "atrium" },
+        { "name": "DB_SSL", "value": "true" },
+        { "name": "DB_POOL_MAX", "value": "15" },
+        { "name": "REDIS_URL", "value": "rediss://<ELASTICACHE_PRIMARY_ENDPOINT>:6379" },
+        { "name": "STORAGE_DRIVER", "value": "s3" },
+        { "name": "S3_BUCKET", "value": "<ATRIUM_UPLOADS_BUCKET>" },
+        { "name": "S3_PREFIX", "value": "uploads/" },
+        { "name": "AWS_REGION", "value": "<REGION>" },
+        { "name": "SHUTDOWN_GRACE_SECONDS", "value": "20" }
+      ],
+      "secrets": [
+        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:<RDS_SECRET_NAME>:password::" },
+        { "name": "SETUP_TOKEN", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:atrium/setup-token" }
+      ],
+      "healthCheck": {
+        "command": ["CMD", "node", "-e", "fetch('http://localhost:3100/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/atrium",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "atrium",
+          "awslogs-create-group": "true"
+        }
+      },
+      "readonlyRootFilesystem": false,
+      "user": "1000:1000"
+    }
+  ]
+}

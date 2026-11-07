@@ -1,0 +1,22 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: atrium
+      POSTGRES_PASSWORD: atrium
+      POSTGRES_DB: atrium
+    ports: ["5460:5432"]
+    volumes: [dbdata:/var/lib/postgresql/data]
+  app:
+    build: .
+    profiles: [full]
+    environment:
+      DATABASE_URL: postgres://atrium:atrium@db:5432/atrium
+      PORT: 3100
+      UPLOAD_DIR: /data/uploads
+    ports: ["3100:3100"]
+    volumes: [uploads:/data/uploads]
+    depends_on: [db]
+volumes:
+  dbdata:
+  uploads:
