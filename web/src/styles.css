@@ -482,3 +482,4 @@ textarea.input { height: auto; min-height: 60px; resize: vertical; }
 .rel-editor .rel-count { width: 64px; }
 .tpl-default { font-size: 11px; color: var(--text-3); border: 1px solid var(--border-strong); border-radius: 3px; padding: 0 4px; line-height: 16px; }
 .callout-icon-img { width: 20px; height: 20px; border-radius: 3px; object-fit: cover; vertical-align: middle; }
+.locked-banner.notion-sync a { color: inherit; text-decoration: underline; }

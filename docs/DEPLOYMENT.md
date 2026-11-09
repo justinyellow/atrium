@@ -32,6 +32,7 @@ All settings come from the environment (`server/src/config.ts`). Startup fails f
 | `SETUP_TOKEN` | — | If set, claiming the first owner account requires it. Always set on internet-reachable instances. |
 | `COOKIE_SECURE` | `false` | `true` behind HTTPS. |
 | `LOG_LEVEL` | `warn` | `info` logs every request (JSON lines on stdout). |
+| `ATRIUM_ENCRYPTION_KEY` | — | 32 bytes (64 hex chars or base64). Encrypts stored secrets: the AI provider key and the Notion integration secret of a linked Notion workspace. Keep it stable — changing it makes stored secrets unreadable (they must be entered again). |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | Hard exit deadline after SIGTERM. Keep below the ECS `stopTimeout` (30s in the template). |
 
 ## Health checks
@@ -49,6 +50,7 @@ All settings come from the environment (`server/src/config.ts`). Startup fails f
   takes over within 30 seconds. Each reminder is also claimed with `FOR UPDATE SKIP LOCKED`, so it fires once.
 - **Schema migrations** run on boot behind an advisory lock, so tasks starting together don't race.
 - **Login rate limiting** is stored in Postgres, so it applies across tasks.
+- **Background jobs** (reminders, email, trash purge, Cognito sync, Notion sync) run on one task at a time (Postgres advisory lock).
 - **Without Redis**, run exactly **one** task. Several tasks without Redis will split live editing between them.
 
 ## Graceful shutdown

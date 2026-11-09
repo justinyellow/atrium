@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { Download, ExternalLink, FileText, Link2, Loader2, Save, Square, Upload } from 'lucide-react';
-import { get, post, put, queryClient } from '../../lib/api';
+import { Download, ExternalLink, FileText, Link2, Loader2, Pause, Play, RefreshCw, Save, Square, Unlink, Upload } from 'lucide-react';
+import { del, get, patch, post, put, queryClient } from '../../lib/api';
 import { useUi } from '../../lib/store';
 import { timeAgo, toast } from '../ui';
 
@@ -21,6 +21,7 @@ import './admin.css';
 
 interface Job {
   id: string;
+  kind?: 'import' | 'sync';
   status: 'running' | 'done' | 'failed' | 'cancelled' | 'interrupted' | 'queued';
   dry_run: boolean;
   options: any;
@@ -48,6 +49,8 @@ const PHASES: Record<string, string> = {
   comments: 'Copying comments',
   finishing: 'Finishing up',
   census: 'Converting (dry run)',
+  checking: 'Checking Notion for changes',
+  listing: 'Listing Notion pages',
   done: 'Done',
 };
 
@@ -63,6 +66,127 @@ function Counts({ c }: { c: any }) {
   return (
     <div className="imp-counts">
       {items.map(([k, v]) => <div key={k as string}><b>{v ?? 0}</b><span>{k}</span></div>)}
+    </div>
+  );
+}
+
+/** One line per sync: what changed. */
+function syncSummary(c: any) {
+  if (!c) return '—';
+  const sum = (k: 'created' | 'updated') => (c.pages?.[k] ?? 0) + (c.databases?.[k] ?? 0) + (c.rows?.[k] ?? 0);
+  const parts = [
+    sum('created') && `${sum('created')} new`,
+    sum('updated') && `${sum('updated')} updated`,
+    c.removed && `${c.removed} moved to trash`,
+    c.restored && `${c.restored} restored`,
+    c.comments && `${c.comments} comments`,
+  ].filter(Boolean);
+  return parts.length ? parts.join(' · ') : 'No changes';
+}
+
+const inMinutes = (iso: string) => {
+  const m = Math.round((new Date(iso).getTime() - Date.now()) / 60000);
+  return m <= 0 ? 'any moment' : m < 60 ? `in ${m} min` : `in ${Math.round(m / 60)} h`;
+};
+
+/** Linked Notion workspace: status, schedule and controls (sync now, pause, new secret, unlink). */
+function NotionLinkCard({ onView }: { onView: (jobId: string) => void }) {
+  const link = useQuery({
+    queryKey: ['notion-link'],
+    queryFn: () => get<any>('/admin/import/notion/link'),
+    refetchInterval: (q) => ((q.state.data as any)?.running ? 3000 : 30000),
+  });
+  const [secret, setSecret] = useState<string | null>(null);
+  const [confirmUnlink, setConfirmUnlink] = useState(false);
+  const l = link.data;
+  const wasRunning = useRef(false);
+  useEffect(() => {
+    if (wasRunning.current && !l?.running) queryClient.invalidateQueries({ queryKey: ['tree'] });
+    wasRunning.current = !!l?.running;
+  }, [l?.running]);
+  if (!l?.linked) return null;
+  const act = async (fn: () => Promise<any>, done?: string) => {
+    try {
+      await fn();
+      if (done) toast(done);
+    } catch (e: any) {
+      toast(e.message);
+    }
+    link.refetch();
+  };
+  return (
+    <div className="set-card imp-card">
+      <div className="imp-head">
+        <span className="imp-logo">N</span>
+        <div style={{ flex: 1 }}>
+          <b>Synced with Notion{l.notionWorkspace ? ` · ${l.notionWorkspace}` : ''}</b>
+          <div className="faint" style={{ fontSize: 12 }}>
+            Changes made in Notion are copied here automatically: edits, new pages and rows, and pages deleted in Notion (moved to the Atrium trash).
+            It only works in one direction. Edits made in Atrium to a synced page are replaced the next time that page changes in Notion.
+          </div>
+        </div>
+        <span className={`imp-pill ${l.running ? 'running' : l.status}`}>{l.running ? 'Syncing…' : l.status === 'active' ? 'Active' : 'Paused'}</span>
+      </div>
+      <div className="imp-link-grid">
+        <div><span>Last sync</span>{l.lastSyncAt ? timeAgo(l.lastSyncAt) : 'Not yet'}</div>
+        <div><span>Next sync</span>{l.running ? 'Running now' : l.status === 'active' && l.nextSyncAt ? inMinutes(l.nextSyncAt) : 'Paused'}</div>
+        <div><span>Last full check</span>{l.lastFullAt ? timeAgo(l.lastFullAt) : 'Not yet'}</div>
+        <div><span>New top-level pages go to</span>{l.teamspaceName ?? '—'}</div>
+      </div>
+      {l.lastError && <div className="imp-status failed" style={{ fontSize: 13, marginBottom: 8 }}>{l.lastError}</div>}
+      <div className="imp-link-sched">
+        <label>Check for changes every{' '}
+          <select className="select" value={l.intervalMinutes} onChange={(e) => act(() => patch('/admin/import/notion/link', { intervalMinutes: Number(e.target.value) }))}>
+            {[5, 15, 30, 60, 240, 1440].map((m) => <option key={m} value={m}>{m < 60 ? `${m} minutes` : m === 60 ? 'hour' : m === 1440 ? 'day' : `${m / 60} hours`}</option>)}
+          </select>
+        </label>
+        <label>Full check (also finds deleted pages) every{' '}
+          <select className="select" value={l.fullCheckHours} onChange={(e) => act(() => patch('/admin/import/notion/link', { fullCheckHours: Number(e.target.value) }))}>
+            {[6, 12, 24, 72, 168].map((h) => <option key={h} value={h}>{h < 24 ? `${h} hours` : h === 24 ? 'day' : h === 168 ? 'week' : `${h / 24} days`}</option>)}
+          </select>
+        </label>
+      </div>
+      {secret !== null && (
+        <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+          <input className="input" type="password" autoComplete="off" placeholder="New integration secret (ntn_…)" value={secret} onChange={(e) => setSecret(e.target.value)} />
+          <button className="btn primary" disabled={!secret.trim()} onClick={() => act(() => patch('/admin/import/notion/link', { token: secret, status: 'active' }), 'Secret replaced').then(() => setSecret(null))}>Save</button>
+          <button className="btn" onClick={() => setSecret(null)}>Cancel</button>
+        </div>
+      )}
+      {confirmUnlink ? (
+        <div className="imp-unlink">
+          <div>Stop syncing and delete the stored secret? Everything already copied stays in Atrium. Changes made in Notion after this won't be copied.</div>
+          <div className="adm-actions">
+            <button className="btn" onClick={() => setConfirmUnlink(false)}>Cancel</button>
+            <button className="btn danger" onClick={() => act(() => del('/admin/import/notion/link'), 'Notion unlinked').then(() => { setConfirmUnlink(false); queryClient.invalidateQueries({ queryKey: ['page'] }); })}><Unlink size={13} /> Unlink</button>
+          </div>
+        </div>
+      ) : (
+        <div className="adm-actions" style={{ justifyContent: 'flex-start', flexWrap: 'wrap' }}>
+          <button className="btn sm" disabled={!!l.running} onClick={() => act(() => post('/admin/import/notion/link/sync', {}), 'Sync started')}><RefreshCw size={13} /> Sync now</button>
+          <button className="btn sm" disabled={!!l.running} title="Compares everything and moves pages deleted in Notion to the trash" onClick={() => act(() => post('/admin/import/notion/link/sync', { full: true }), 'Full check started')}>Full check now</button>
+          {l.status === 'active'
+            ? <button className="btn sm" onClick={() => act(() => patch('/admin/import/notion/link', { status: 'paused' }))}><Pause size={13} /> Pause</button>
+            : <button className="btn sm" onClick={() => act(() => patch('/admin/import/notion/link', { status: 'active' }))}><Play size={13} /> Resume</button>}
+          <button className="btn sm" onClick={() => setSecret('')}>Replace secret</button>
+          <button className="btn sm danger" onClick={() => setConfirmUnlink(true)}><Unlink size={13} /> Unlink</button>
+        </div>
+      )}
+      {!!l.recent?.length && (
+        <table className="set-table" style={{ marginTop: 12 }}>
+          <thead><tr><th>When</th><th>Type</th><th>Result</th><th /></tr></thead>
+          <tbody>
+            {l.recent.filter((j: any, i: number) => i < 3 || j.status !== 'done' || syncSummary(j.counts) !== 'No changes').slice(0, 8).map((j: any) => (
+              <tr key={j.id}>
+                <td>{timeAgo(j.created_at)}</td>
+                <td>{j.full ? 'Full check' : 'Changes'}</td>
+                <td>{j.status === 'done' ? syncSummary(j.counts) : j.status === 'running' ? 'Running…' : j.error ?? j.status}</td>
+                <td style={{ textAlign: 'right' }}>{j.status !== 'running' && <button className="btn sm" onClick={() => onView(j.id)}>View</button>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }
@@ -234,6 +358,8 @@ export function ImportTab() {
   const [assign, setAssign] = useState<Record<string, string>>({});
   const [tsMeta, setTsMeta] = useState<Record<string, Omit<TsSpec, 'rootIds' | 'name'>>>({});
   const [privatePages, setPrivatePages] = useState<'owner' | 'skip'>('owner');
+  const [keepInSync, setKeepInSync] = useState(false);
+  const linked = useQuery({ queryKey: ['notion-link'], queryFn: () => get<any>('/admin/import/notion/link') });
   const fileRef = useRef<HTMLInputElement>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -320,8 +446,10 @@ export function ImportTab() {
       const r = await post<{ id: string }>('/admin/import/notion', {
         token, rootIds, targetTeamspaceId: teamspace, peopleMode: people, dryRun, force, teamspaces: specs(),
         followLinks, includeInlineComments: inlineComments, contentMode: blockMode ? 'blocks' : 'auto', privatePages,
+        keepInSync: keepInSync && !dryRun,
       });
       setJobId(r.id);
+      if (keepInSync && !dryRun) queryClient.invalidateQueries({ queryKey: ['notion-link'] });
       queryClient.invalidateQueries({ queryKey: ['import-jobs'] });
     } catch (e: any) {
       toast(e.message);
@@ -342,6 +470,7 @@ export function ImportTab() {
   return (
     <div className="imp">
       <h2>Import</h2>
+      <NotionLinkCard onView={setJobId} />
       <div className="set-card imp-card">
         <div className="imp-head"><span className="imp-logo">N</span><div><b>Notion</b><div className="faint" style={{ fontSize: 12 }}>Pages, databases (with views, relations, formulas), files, comments and people.</div></div></div>
         <ol className="imp-steps">
@@ -351,7 +480,7 @@ export function ImportTab() {
         </ol>
         <label className="adm-label">Integration secret</label>
         <input className="input" type="password" autoComplete="off" placeholder="ntn_…" value={token} onChange={(e) => setToken(e.target.value)} />
-        <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>Used only for this import and never stored.</div>
+        <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>{keepInSync ? 'Stored encrypted so Atrium can keep checking Notion for changes. Unlinking deletes it.' : 'Used only for this import and never stored.'}</div>
         <label className="adm-label">Pages or databases to import <span className="faint">(optional — leave empty to import everything shared with the integration)</span></label>
         <textarea className="input" rows={2} placeholder="Paste Notion page or database links, one per line" value={roots} onChange={(e) => setRoots(e.target.value)} />
         <label className="adm-label">Import into teamspace</label>
@@ -381,6 +510,14 @@ export function ImportTab() {
           <button className="btn sm" title="Point links in earlier imports at pages imported since" onClick={relink}><Link2 size={13} /> Relink imported pages</button>
           <input ref={fileRef} type="file" accept="application/json,.json" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadMap(f); e.target.value = ''; }} />
         </div>
+        <label className="adm-check" style={{ marginTop: 12 }}>
+          <input type="checkbox" checked={keepInSync} disabled={linked.data && !linked.data.linked && linked.data.encryptionAvailable === false} onChange={(e) => setKeepInSync(e.target.checked)} />
+          <span>
+            <b>Keep Atrium in sync with Notion</b>: after the import, check Notion for changes every 15 minutes and copy them here until you unlink.
+            {linked.data?.linked ? ' This replaces the current link’s settings.' : ''}
+            {linked.data && !linked.data.linked && linked.data.encryptionAvailable === false ? ' (Needs ATRIUM_ENCRYPTION_KEY set on the server.)' : ''}
+          </span>
+        </label>
         <div className="adm-actions">
           {running ? (
             <button className="btn" onClick={async () => { try { await post(`/admin/import/jobs/${jobId}/cancel`); } catch (e: any) { toast(e.message); } }}><Square size={13} /> Cancel</button>
@@ -402,7 +539,7 @@ export function ImportTab() {
             ) : (
               <>
                 <div className={`imp-status ${job.data.status}`}>
-                  {job.data.status === 'done' ? (job.data.dry_run ? 'Preview ready' : 'Import complete') : job.data.status === 'cancelled' ? 'Cancelled' : job.data.status === 'interrupted' ? 'Interrupted' : 'Import failed'}
+                  {job.data.status === 'done' ? (job.data.dry_run ? 'Preview ready' : job.data.kind === 'sync' ? `Sync complete · ${syncSummary(job.data.report?.counts)}` : 'Import complete') : job.data.status === 'cancelled' ? 'Cancelled' : job.data.status === 'interrupted' ? 'Interrupted' : 'Import failed'}
                   {job.data.error && job.data.status !== 'cancelled' ? ` — ${job.data.error}` : ''}
                 </div>
                 <Report

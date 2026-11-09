@@ -134,5 +134,21 @@ requesting user** through the existing permission checks. Both features below us
   asking before destructive changes.
 - Models: Opus for agents and Q&A, Haiku for autofill and short rewrites.
 
-### Still pending: Notion importer
-Blocked on a Notion integration token (see the import plan in conversation / README once written).
+### Notion importer and sync
+Settings → Import → Notion copies pages, databases (schemas, rows, views, templates), files, comments and people
+through the official Notion API, recording every Notion id in `import_mappings` so re-runs update instead of
+duplicating (`server/src/importers/notion`).
+
+**Keep in sync** (one link per workspace) stores the integration secret encrypted (`ATRIUM_ENCRYPTION_KEY`) and keeps
+Atrium as a one-way copy of Notion until it is unlinked — for running both side by side before a switch-over:
+- Every N minutes (default 15): Notion search sorted by `last_edited_time` lists what changed since the last sync
+  (with a 10-minute overlap); only those pages, rows and databases are re-read. New pages are added when they sit
+  under something imported (or at the top level when the link covers everything shared with the integration).
+- Every N hours (default 24), a full check lists everything and compares timestamps, catching anything the
+  incremental pass missed. Imported objects Notion no longer lists are checked one by one; only those Notion reports
+  as deleted go to the Atrium trash (restorable; brought back if restored in Notion). Objects the integration can no
+  longer see are counted, never removed.
+- Notion wins: edits made in Atrium to a synced page are replaced when that page next changes in Notion (the previous
+  version stays in page history). A page deleted by someone in Atrium is not re-created. Synced pages show a banner.
+- Known gaps: comments added in Notion arrive when their page next changes; moves of databases are not followed.
+- Unlinking deletes the stored secret and stops syncing; all content stays in Atrium.

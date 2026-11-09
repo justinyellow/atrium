@@ -261,7 +261,7 @@ test('comments, people and report', async () => {
   assert.equal(threads[0].author_id, admin.id);
   assert.match(threads[0].body, /@\[Grace Hopper\]\(/);
   assert.equal(new Date(threads[0].created_at).toISOString(), '2025-05-01T10:00:00.000Z');
-  const job = await one<any>(`select report from import_jobs where workspace_id = $1 and not dry_run order by created_at desc limit 1`, [admin.workspaceId]);
+  const job = await one<any>(`select report from import_jobs where workspace_id = $1 and not dry_run and kind = 'import' order by created_at desc limit 1`, [admin.workspaceId]);
   assert.equal(job.report.counts.people.matched, 1);
   assert.equal(job.report.counts.people.created, 1);
   assert.ok(job.report.warningCounts.view_filter >= 1);
@@ -466,6 +466,89 @@ test('fallback default view is replaced once the real views can be read', async 
   await go(fakeNotionFetch(ws, { rateLimitOnce: true }));
   const after1 = await q<{ name: string }>(`select name from database_views where database_id = $1 and block_id is null order by position`, [db2]);
   assert.deepEqual(after1.map((v) => v.name), ['All'], 'fallback removed once the real views import');
+});
+
+test('sync: pulls edits, new pages and row changes; full check trashes deletions; restores', async () => {
+  const ws = buildWorkspace();
+  const base = await run(ws);
+  assert.equal(base.status, 'done', base.error);
+  const sync = async (since: Date | null) => {
+    const { id, done } = await startNotionImport(
+      admin,
+      { token: 'secret_fake', targetTeamspaceId: tsId, peopleMode: 'guests' },
+      { fetchImpl: fakeNotionFetch(ws), fileImporter: fakeFiles as any, minIntervalMs: 0 },
+      { kind: 'sync', since },
+    );
+    await done;
+    return one<any>('select * from import_jobs where id = $1', [id]);
+  };
+  const since = new Date('2025-12-31T00:00:00.000Z');
+  const T2 = '2026-01-01T10:00:00.000Z';
+
+  // Nothing changed: only the search listing is read, nothing is written.
+  const idle = await sync(since);
+  assert.equal(idle.status, 'done', idle.error);
+  assert.equal(idle.kind, 'sync');
+  assert.equal(idle.report.counts.pages.updated + idle.report.counts.pages.created + idle.report.counts.rows.updated, 0);
+  assert.ok(idle.report.requests <= 6, `idle sync made ${idle.report.requests} requests`);
+
+  // Edits in Notion: a renamed page, a new sub-page under Handbook, a changed row.
+  const NEW = '11111111-0000-4000-8000-0000000000ff';
+  (ws.pages as any)[IDS.sub] = { ...ws.pages[IDS.sub], last_edited_time: T2, properties: { title: { id: 'title', type: 'title', title: [rt('Sub page (renamed)')] } } };
+  (ws.pages as any)[NEW] = { ...ws.pages[IDS.sub], id: NEW, created_time: T2, last_edited_time: T2, parent: { type: 'page_id', page_id: IDS.handbook }, properties: { title: { id: 'title', type: 'title', title: [rt('Added later')] } } };
+  ws.children.set(NEW, [{ object: 'block', id: '55555555-0000-4000-8000-0000000000ff', type: 'paragraph', has_children: false, created_time: T2, last_edited_time: T2, paragraph: { rich_text: [rt('Fresh content')], color: 'default' } }]);
+  (ws.pages as any)[IDS.r1] = { ...ws.pages[IDS.r1], last_edited_time: T2, properties: { ...ws.pages[IDS.r1].properties, Points: { id: 'pts', type: 'number', number: 8 } } };
+  // Someone also edited the Atrium copy of Sub page: their version is kept in history before Notion's replaces it.
+  const subId = (await atriumId(IDS.sub))!;
+  await q(`update page_content set updated_at = now() + interval '1 hour' where page_id = $1`, [subId]);
+  const versionsBefore = (await one<any>('select count(*)::int n from page_versions where page_id = $1', [subId])).n;
+  const job = await sync(since);
+  assert.equal(job.status, 'done', job.error);
+  assert.equal((await one<any>('select count(*)::int n from page_versions where page_id = $1', [subId])).n, versionsBefore + 1, 'Atrium edit kept in history');
+  const c = job.report.counts;
+  assert.equal(c.pages.created, 1, JSON.stringify(c));
+  assert.equal(c.pages.updated, 1, JSON.stringify(c));
+  assert.equal(c.rows.updated, 1, JSON.stringify(c));
+  const sub = (await atriumId(IDS.sub))!;
+  assert.equal((await one<any>('select title from pages where id = $1', [sub])).title, 'Sub page (renamed)');
+  const added = (await atriumId(NEW))!;
+  const addedRow = await one<any>('select parent_id, teamspace_id from pages where id = $1', [added]);
+  assert.equal(addedRow.parent_id, await atriumId(IDS.handbook), 'new page lands under its imported parent');
+  assert.equal(addedRow.teamspace_id, tsId);
+  assert.ok(JSON.stringify(await blocksOf(added)).includes('Fresh content'));
+  const db1 = (await atriumId(IDS.db1))!;
+  const schema = (await one<any>('select schema from databases where page_id = $1', [db1])).schema as any[];
+  const pts = schema.find((p) => p.name === 'Points').id;
+  assert.equal((await one<any>('select props from pages where id = $1', [await atriumId(IDS.r1)])).props[pts], 8);
+  // Links in re-read pages still point at earlier imported pages (preloaded mappings).
+  assert.ok(!job.report.warnings.some((w: any) => w.kind === 'link_unresolved'), JSON.stringify(job.report.warnings));
+
+  // A row deleted in Notion: incremental syncs can't see it; the full check trashes the copy.
+  (ws.pages as any)[IDS.r2] = { ...ws.pages[IDS.r2], in_trash: true };
+  const r2 = (await atriumId(IDS.r2))!;
+  await sync(since);
+  assert.equal((await one<any>('select deleted_at from pages where id = $1', [r2])).deleted_at, null);
+  const fullJob = await sync(null);
+  assert.equal(fullJob.status, 'done', fullJob.error);
+  assert.equal(fullJob.report.counts.removed, 1, JSON.stringify(fullJob.report.counts));
+  assert.equal(fullJob.report.counts.pages.updated, 0, 'full check re-reads nothing unchanged');
+  assert.ok((await one<any>('select deleted_at from pages where id = $1', [r2])).deleted_at, 'deleted row trashed');
+  assert.ok(await one('select 1 from pages where id = $1 and deleted_at is null', [sub]), 'untouched pages stay');
+
+  // Restored in Notion: the same copy comes back (no duplicate).
+  (ws.pages as any)[IDS.r2] = { ...ws.pages[IDS.r2], in_trash: false, last_edited_time: '2026-01-02T10:00:00.000Z' };
+  const back = await sync(since);
+  assert.equal(back.status, 'done', back.error);
+  assert.equal(back.report.counts.restored, 1);
+  assert.equal(await atriumId(IDS.r2), r2);
+  assert.equal((await one<any>('select deleted_at from pages where id = $1', [r2])).deleted_at, null);
+
+  // A copy someone deleted in Atrium is not brought back by a Notion edit.
+  await q('update pages set deleted_at = now() where id = $1', [added]);
+  (ws.pages as any)[NEW] = { ...ws.pages[NEW], last_edited_time: '2026-01-03T10:00:00.000Z' };
+  const kept = await sync(since);
+  assert.equal(kept.report.counts.deletedInAtrium, 1);
+  assert.equal(kept.report.counts.pages.created, 0, 'no duplicate of a page deleted in Atrium');
 });
 
 test('cancel stops a running import', async () => {

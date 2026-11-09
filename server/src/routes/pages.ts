@@ -115,6 +115,12 @@ export async function getPageDto(user: AuthUser, id: string) {
     page.kind === 'row' ? one('select schema from databases where page_id = $1', [page.parent_id]) : null,
   ]);
   const ts = page.teamspace_id ? await one('select id, name, icon from teamspaces where id = $1', [page.teamspace_id]) : null;
+  // Copy of a page in a linked Notion workspace (kept in sync until the link is removed).
+  const mirror = await one<{ source_id: string; synced_at: string; status: string }>(
+    `select m.source_id, m.updated_at as synced_at, l.status from import_mappings m join notion_links l on l.workspace_id = $2
+     where m.source = 'notion' and m.atrium_id = $1 and m.kind in ('page', 'database', 'row', 'template')`,
+    [id, user.workspaceId],
+  );
   return {
     ...page,
     level,
@@ -124,6 +130,9 @@ export async function getPageDto(user: AuthUser, id: string) {
     updated_by_user: editor,
     teamspace: ts,
     parent_schema: db?.schema ?? null,
+    notion_sync: mirror
+      ? { url: `https://www.notion.so/${mirror.source_id.replace(/-/g, '')}`, synced_at: mirror.synced_at, paused: mirror.status !== 'active' }
+      : null,
   };
 }
 

@@ -197,8 +197,8 @@ export function buildWorkspace() {
       parent: { type: 'workspace', workspace: true }, data_sources: [{ id: IDS.ds2, name: 'Estimates' }], created_time: T0, last_edited_time: T1, created_by: user(IDS.justin), last_edited_by: user(IDS.justin), archived: false, in_trash: false },
   };
   const dataSources: Record<string, any> = {
-    [IDS.ds1]: { object: 'data_source', id: IDS.ds1, title: [rt('Tasks')], properties: ds1Props, parent: { type: 'database_id', database_id: IDS.db1 }, database_parent: { type: 'page_id', page_id: IDS.handbook } },
-    [IDS.ds2]: { object: 'data_source', id: IDS.ds2, title: [rt('Estimates')], properties: ds2Props, parent: { type: 'database_id', database_id: IDS.db2 }, database_parent: { type: 'workspace', workspace: true } },
+    [IDS.ds1]: { object: 'data_source', id: IDS.ds1, title: [rt('Tasks')], properties: ds1Props, parent: { type: 'database_id', database_id: IDS.db1 }, database_parent: { type: 'page_id', page_id: IDS.handbook }, last_edited_time: T1 },
+    [IDS.ds2]: { object: 'data_source', id: IDS.ds2, title: [rt('Estimates')], properties: ds2Props, parent: { type: 'database_id', database_id: IDS.db2 }, database_parent: { type: 'workspace', workspace: true }, last_edited_time: T1 },
   };
   const views: Record<string, any[]> = {
     [IDS.db1]: [
@@ -260,7 +260,9 @@ export function fakeNotionFetch(ws: FakeWorkspace | ReturnType<typeof buildExtra
     if (path === '/users/me') return res(200, ws.users.find((x: any) => x.type === 'bot'));
     if (path === '/search') {
       const want = body.filter?.value;
-      const all = want === 'page' ? Object.values(ws.pages) : want === 'data_source' ? Object.values(ws.dataSources) : [];
+      let all: any[] = want === 'page' ? Object.values(ws.pages) : want === 'data_source' ? Object.values(ws.dataSources) : [];
+      all = all.filter((x: any) => !x.in_trash);
+      if (body.sort?.timestamp === 'last_edited_time') all = [...all].sort((a, b) => String(b.last_edited_time ?? '').localeCompare(String(a.last_edited_time ?? '')));
       return res(200, paged(all, cursor));
     }
     if ((m = path.match(/^\/pages\/([^/]+)\/properties\/([^/]+)$/))) {

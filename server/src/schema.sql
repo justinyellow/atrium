@@ -519,3 +519,24 @@ create table if not exists import_settings (
   updated_at timestamptz not null default now(),
   primary key (workspace_id, source, key)
 );
+
+-- Linked Notion workspace (one per Atrium workspace): Atrium keeps a one-way copy and pulls changes on a schedule.
+-- The integration token is stored encrypted (ATRIUM_ENCRYPTION_KEY). Unlinking deletes this row; content stays.
+create table if not exists notion_links (
+  workspace_id uuid primary key references workspaces(id) on delete cascade,
+  status text not null default 'active',
+  token_enc text not null,
+  options jsonb not null default '{}',
+  notion_workspace text,
+  interval_minutes int not null default 15,
+  full_check_hours int not null default 24,
+  cursor timestamptz,
+  last_sync_at timestamptz,
+  last_full_at timestamptz,
+  last_job_id uuid,
+  last_error text,
+  created_by uuid references users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+alter table import_jobs add column if not exists kind text not null default 'import';

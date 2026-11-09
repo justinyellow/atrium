@@ -5,6 +5,7 @@ import {
   BadgeCheck,
   ChevronsRight, Star, MoreHorizontal, MessageSquare, Smile, Image as ImageIcon, MessageSquarePlus, Lock, Unlock, Link2,
   Copy, CornerUpRight, Trash2, History, Download, MoveHorizontal, Type, Undo2, Link as LinkIcon,
+  RefreshCw,
 } from 'lucide-react';
 import { del, get, patch, post, put, queryClient } from '../lib/api';
 import { useMe, usePage } from '../lib/hooks';
@@ -169,6 +170,16 @@ export function PageContent({ pageId, peek, onPresence }: { pageId: string; peek
             </div>
           )}
           {page.locked && <div className="locked-banner"><Lock size={12} /> Locked — unlock from the ⋯ menu to edit</div>}
+          {(page as any).notion_sync && (
+            <div className="locked-banner notion-sync">
+              <RefreshCw size={12} />
+              <span>
+                {(page as any).notion_sync.paused ? 'Copied from Notion (sync paused)' : 'Synced from Notion'} · last copied {timeAgo((page as any).notion_sync.synced_at).toLowerCase()}
+                {page.level !== 'view' && !(page as any).notion_sync.paused ? ' · edits made here are replaced when the page changes in Notion' : ''}
+                {' · '}<a href={(page as any).notion_sync.url} target="_blank" rel="noreferrer">Open in Notion</a>
+              </span>
+            </div>
+          )}
           <Title page={page} onEnter={focusEditor} />
           <PageVerification page={page} />
           <IconPicker anchor={page.icon ? iconRef.current : addIconRef.current} open={iconPicker} onClose={() => setIconPicker(false)} onPick={(icon) => { save({ icon }); setIconPicker(false); }} />

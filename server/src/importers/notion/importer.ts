@@ -93,7 +93,13 @@ interface Item {
   depth?: number;
 }
 
-type QueueEntry = { kind: 'page' | 'database' | 'unknown'; id: string; parent: string | null; inline?: boolean; pos?: number; depth?: number };
+type QueueEntry = { kind: 'page' | 'database' | 'unknown'; id: string; parent: string | null; inline?: boolean; pos?: number; depth?: number; raw?: any };
+
+/** A previously imported Notion object (sync mode). */
+interface Mapped { id: string; kind: string; title: string; teamspaceId: string | null; ownerId: string | null; deleted: boolean; trashedBySync: boolean; lastEdited: string | null; syncedAt: string | null }
+
+/** Notion rounds last_edited_time to the minute, so an edit in the same minute as our read keeps the stamp. */
+const SAME_MINUTE_MS = 120_000;
 
 const NOTION_ID_RE = /([0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12})/i;
 const notionHost = (url: string) => /^(https?:\/\/)?([\w-]+\.)?notion\.(so|site|com)\//i.test(url) || /^\{\{/.test(url);
@@ -125,7 +131,7 @@ export class NotionImport {
   notionUsers = new Map<string, any>();
   userMap = new Map<string, { id: string; name: string }>();
   atrium = new Map<string, { id: string; title: string }>(); // Notion id (page/db/data source) → Atrium page
-  existing = new Map<string, { atrium_id: string; source_last_edited: string | null }>();
+  existing = new Map<string, { atrium_id: string; source_last_edited: string | null; synced_at?: string | null }>();
   warnings: Warning[] = [];
   warningCounts: Record<string, number> = {};
   counts: Record<string, any> = {
@@ -156,6 +162,16 @@ export class NotionImport {
   private currentPage: string | null = null;
   cancelled = false;
   private abort = new AbortController();
+  /**
+   * Sync mode (linked Notion workspace): only objects that changed since the last sync are read and written.
+   * Everything imported before is preloaded so links, parents and placement resolve without re-reading it.
+   */
+  sync = false;
+  mapped = new Map<string, Mapped>();
+  /** Sync: positions of already-imported children, from parents whose content was re-read. */
+  private positions = new Map<string, number>();
+  /** Sync: Notion ids whose Atrium copies go to (or come back from) the trash. */
+  removals = { trash: new Set<string>(), restore: new Set<string>(), noAccess: 0, skippedDeletedHere: 0 };
 
   constructor(
     public opts: ImportOptions,
@@ -376,6 +392,224 @@ export class NotionImport {
     for (const id of [...this.unresolved.keys()]) if (this.items.has(id)) this.unresolved.delete(id);
   }
 
+  // ---------------------------------------------------------------- sync (linked Notion workspace)
+
+  /** Every Notion → Atrium mapping in this workspace, including trashed copies (sync mode). */
+  async loadAllMappings() {
+    const rows = await q<any>(
+      `select m.source_id, m.atrium_id, m.kind, m.source_last_edited, m.updated_at,
+         coalesce((m.meta->>'trashedBySync')::boolean, false) as trashed_by_sync,
+         p.title, p.teamspace_id, p.owner_id, p.deleted_at is not null as deleted
+       from import_mappings m join pages p on p.id = m.atrium_id and p.workspace_id = $1
+       where m.source = 'notion' and m.kind in ('page', 'database', 'row', 'template')`,
+      [this.admin.workspaceId],
+    );
+    for (const r of rows) {
+      this.mapped.set(r.source_id, {
+        id: r.atrium_id, kind: r.kind, title: r.title, teamspaceId: r.teamspace_id, ownerId: r.owner_id, deleted: r.deleted,
+        trashedBySync: r.trashed_by_sync, lastEdited: r.source_last_edited ? new Date(r.source_last_edited).toISOString() : null,
+        syncedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+      });
+      if (!r.deleted) this.atrium.set(r.source_id, { id: r.atrium_id, title: r.title });
+    }
+  }
+
+  /** Already imported and unchanged since (allowing for Notion's minute-rounded timestamps). */
+  private fresh(nid: string, lastEdited?: string, compareStamp = true) {
+    if (this.opts.force) return false;
+    const m = this.mapped.get(nid);
+    if (!m || m.deleted || !m.syncedAt || !lastEdited) return false;
+    const le = new Date(lastEdited).getTime();
+    if (compareStamp && (!m.lastEdited || new Date(m.lastEdited).getTime() < le)) return false;
+    return new Date(m.syncedAt).getTime() >= le + SAME_MINUTE_MS;
+  }
+
+  /**
+   * Sync discovery: what changed in Notion since `since` (null = compare everything, which also finds deletions).
+   * Changed objects that were imported before are re-read; new ones are added when they sit under something
+   * imported (or, when the link covers the whole workspace, at the top level). Unchanged objects cost nothing
+   * beyond the search listing.
+   */
+  async discoverChanges(since: Date | null) {
+    this.sync = true;
+    this.onProgress('checking', 0, 0);
+    this.skipPrivate = this.privateRootIds();
+    await this.loadAllMappings();
+    const gone = (x: any) => !!(x?.archived || x?.is_archived || x?.in_trash);
+    const live = (id: string | null | undefined) => !!id && !!this.mapped.get(id) && !this.mapped.get(id)!.deleted;
+    // Listing everything (full check) can mean tens of thousands of objects: keep ids, and full objects only for
+    // what may need work (changed, new, or deleted-but-imported).
+    const seen = new Set<string>();
+    let listed = 0;
+    const visit = (o: any) => {
+      if (++listed % 500 === 0) this.onProgress('listing', listed, 0);
+      const key = o.object === 'data_source' ? (this.mapped.has(o.id) ? o.id : o.parent?.database_id) : o.id;
+      if (key && !gone(o)) seen.add(key);
+      if (gone(o)) return live(key);
+      if (o.object === 'data_source') return !this.fresh(key, o.last_edited_time, false);
+      return !this.fresh(o.id, o.last_edited_time);
+    };
+    const [pages, sources] = await Promise.all([this.client.searchSince('page', since, visit), this.client.searchSince('data_source', since, visit)]);
+    this.counts.checked = listed;
+    const roots = new Set<string>();
+    for (const r of this.opts.rootIds ?? []) { const n = normalizeNotionId(r); if (n) roots.add(n); }
+    for (const t of this.opts.teamspaces ?? []) for (const r of t.rootIds) { const n = normalizeNotionId(r); if (n) roots.add(n); }
+    const wholeWorkspace = !this.opts.rootIds?.length;
+    const queue: QueueEntry[] = [];
+    const push = (e: QueueEntry) => {
+      if (this.queued.has(e.id)) return;
+      this.queued.add(e.id);
+      queue.push(e);
+    };
+    /** Decides whether an imported copy should be re-read: false when the Atrium copy was deleted by a person. */
+    const accept = (key: string) => {
+      const m = this.mapped.get(key);
+      if (m?.deleted && !m.trashedBySync) { this.removals.skippedDeletedHere++; return false; }
+      if (m?.deleted) this.removals.restore.add(key);
+      return true;
+    };
+
+    // New objects: kept when their parent is imported (or new and kept), or they are a mapped root, or the link
+    // covers the whole workspace and they are top-level (their parent is the workspace or not visible).
+    const fresh = new Map<string, { kind: 'page' | 'database'; parent: string | null; parentType: string; raw?: any }>();
+    const decided = new Map<string, boolean>();
+    const inScope = async (id: string, depth = 0): Promise<boolean> => {
+      if (decided.has(id)) return decided.get(id)!;
+      const c = fresh.get(id)!;
+      let ok = roots.has(id) || live(c.parent);
+      if (!ok && c.parent && fresh.has(c.parent) && depth < 50) ok = await inScope(c.parent, depth + 1);
+      if (!ok && wholeWorkspace) {
+        if (c.parentType === 'workspace') ok = true;
+        else if (c.parent && !fresh.has(c.parent) && !this.mapped.has(c.parent)) {
+          ok = await this.client.page(c.parent).then(() => false, (e) => e instanceof NotionApiError && e.status === 404);
+          if (ok) c.parent = null;
+        }
+      }
+      if (ok && c.parent && !live(c.parent) && !fresh.has(c.parent)) c.parent = null;
+      decided.set(id, ok);
+      return ok;
+    };
+
+    for (const s of sources) {
+      const dbId = s.parent?.database_id;
+      if (!dbId) continue;
+      const key = this.mapped.has(s.id) ? s.id : dbId;
+      if (gone(s)) { if (live(key)) this.removals.trash.add(key); continue; }
+      if (this.mapped.has(key) && !accept(key)) continue;
+      if (this.mapped.has(key)) { push({ kind: 'database', id: dbId, parent: null }); continue; }
+      const dpar = s.database_parent ?? {};
+      let parent: string | null = dpar.type === 'page_id' ? dpar.page_id : null;
+      if (dpar.type === 'block_id') parent = await this.owningPage(dpar.block_id).catch(() => null);
+      fresh.set(dbId, { kind: 'database', parent, parentType: dpar.type ?? 'workspace' });
+    }
+    const rows: any[] = [];
+    for (const p of pages) {
+      const par = p.parent ?? {};
+      if (gone(p)) { if (live(p.id)) this.removals.trash.add(p.id); continue; }
+      if (!accept(p.id)) continue;
+      if (par.type === 'data_source_id' || par.type === 'database_id') { rows.push(p); continue; }
+      const known = this.mapped.has(p.id);
+      let parent: string | null = par.type === 'page_id' ? par.page_id : null;
+      if (par.type === 'block_id') parent = known ? null : await this.owningPage(par.block_id).catch(() => null);
+      if (known) push({ kind: 'page', id: p.id, parent: parent && (live(parent) || this.mapped.has(parent)) ? parent : null, raw: p });
+      else fresh.set(p.id, { kind: 'page', parent, parentType: par.type ?? 'workspace', raw: p });
+    }
+    await this.restoreRemoved();
+    for (const [id, c] of fresh) {
+      if (this.opts.privatePages === 'skip' && this.skipPrivate.has(id)) continue;
+      if (await inScope(id)) push({ kind: c.kind, id, parent: c.parent, raw: c.raw, depth: 0 });
+    }
+    await this.drain(queue, push);
+
+    // Rows of imported databases (rows of new databases came with them).
+    const rowItems: Item[] = [];
+    for (const p of rows) {
+      if (this.items.has(p.id)) continue;
+      const par = p.parent;
+      const key = par.data_source_id && this.mapped.has(par.data_source_id) ? par.data_source_id : par.database_id;
+      if (!live(key) && !this.items.has(key)) continue;
+      let ds = par.data_source_id;
+      if (!ds) ds = (await this.client.database(par.database_id).catch(() => null))?.data_sources?.[0]?.id;
+      if (!ds) continue;
+      const m = this.mapped.get(p.id);
+      const item: Item = { kind: m?.kind === 'template' ? 'template' : 'row', notionId: p.id, raw: p, parent: key, dataSourceId: ds, title: this.pageTitle(p), order: -1 };
+      this.items.set(p.id, item);
+      this.order.push(p.id);
+      rowItems.push(item);
+    }
+    await mapLimit(rowItems, this.opts.concurrency ?? 4, async (ri) => {
+      this.check();
+      const kids = await this.fetchContent(ri);
+      this.pushKids(kids, ri.notionId, push);
+    });
+    await this.drain(queue, push);
+    for (const id of [...this.unresolved.keys()]) if (this.items.has(id) || this.atrium.has(id)) this.unresolved.delete(id);
+
+    // Full check: imported objects Notion no longer lists. Only those Notion reports as deleted are trashed here;
+    // ones the integration can no longer see are counted, never removed.
+    if (since === null) {
+      const missing = [...this.mapped].filter(([id, m]) => !m.deleted && m.kind !== 'template' && !seen.has(id) && !this.items.has(id) && !this.removals.trash.has(id));
+      let n = 0;
+      await mapLimit(missing.slice(0, 2000), this.opts.concurrency ?? 4, async ([id, m]) => {
+        this.check();
+        this.onProgress('checking', ++n, missing.length);
+        try {
+          const o = m.kind === 'database'
+            ? await this.client.database(id).catch((e) => (e instanceof NotionApiError && e.status === 404 ? this.client.dataSource(id) : Promise.reject(e)))
+            : await this.client.page(id);
+          if (gone(o)) this.removals.trash.add(id);
+        } catch (e: any) {
+          if (e instanceof NotionApiError && (e.status === 404 || e.status === 403)) this.removals.noAccess++;
+          else this.warn('fetch_failed', `Could not check whether this was deleted (${e.message})`, id);
+        }
+      });
+      if (missing.length > 2000) this.warn('limit', `${missing.length - 2000} more imported items were not checked for deletion; the next full check continues`);
+    }
+  }
+
+  /** Atrium page ids of a page and everything under it. */
+  private async subtree(id: string, deletedWithRoot = false) {
+    // deletedWithRoot: only pages trashed in the same statement as the root (same deleted_at).
+    const rows = await q<{ id: string }>(
+      `with recursive t as (select id from pages where id = $1 union all select p.id from pages p join t on p.parent_id = t.id)
+       select p.id from t join pages p on p.id = t.id
+       where not $2 or p.deleted_at = (select deleted_at from pages where id = $1)`,
+      [id, deletedWithRoot],
+    );
+    return rows.map((r) => r.id);
+  }
+
+  /** Brings back copies this sync trashed earlier, when Notion restored the original. */
+  private async restoreRemoved() {
+    for (const nid of this.removals.restore) {
+      const m = this.mapped.get(nid)!;
+      const ids = await this.subtree(m.id, true);
+      await q(`update pages set deleted_at = null, deleted_by = null where id = any($1::uuid[])`, [ids]);
+      await q(`update import_mappings set meta = coalesce(meta, '{}'::jsonb) - 'trashedBySync' where source = 'notion' and source_id = $1`, [nid]);
+      m.deleted = false;
+      this.atrium.set(nid, { id: m.id, title: m.title });
+      this.counts.restored = (this.counts.restored ?? 0) + 1;
+    }
+  }
+
+  /** Moves copies of objects deleted in Notion to the Atrium trash (restorable; purged on the usual schedule). */
+  async applyRemovals() {
+    let n = 0;
+    for (const nid of this.removals.trash) {
+      const m = this.mapped.get(nid);
+      if (!m || m.deleted) continue;
+      const ids = await this.subtree(m.id);
+      await q(`update pages set deleted_at = now(), deleted_by = $2 where id = any($1::uuid[]) and deleted_at is null`, [ids, this.admin.id]);
+      await q(`update import_mappings set meta = coalesce(meta, '{}'::jsonb) || '{"trashedBySync": true}'::jsonb where source = 'notion' and source_id = $1`, [nid]);
+      m.deleted = true;
+      n++;
+    }
+    this.counts.removed = n;
+    if (this.removals.noAccess) this.counts.noLongerShared = this.removals.noAccess;
+    if (this.removals.skippedDeletedHere) this.counts.deletedInAtrium = this.removals.skippedDeletedHere;
+    if (n) emit({ type: 'tree' });
+  }
+
   /** Walks a block's parents up to the page that contains it. */
   private async owningPage(blockId: string): Promise<string | null> {
     let id = blockId;
@@ -439,7 +673,8 @@ export class NotionImport {
     }
     let kind = it.kind;
     let page: any;
-    if (kind === 'unknown' || kind === 'page') {
+    if (it.raw) page = it.raw;
+    else if (kind === 'unknown' || kind === 'page') {
       try {
         page = await this.client.page(it.id);
         kind = 'page';
@@ -465,11 +700,23 @@ export class NotionImport {
       if (dbId) push({ kind: 'database', id: dbId, parent: null, depth: it.depth });
       return;
     }
-    const item: Item = { kind: 'page', notionId: page.id, raw: page, parent: it.parent, title: this.pageTitle(page), order: it.pos ?? this.order.length, depth: it.depth ?? 0 };
+    const item: Item = { kind: 'page', notionId: page.id, raw: page, parent: it.parent, title: this.pageTitle(page), order: it.pos ?? (this.sync ? -1 : this.order.length), depth: it.depth ?? 0 };
     this.items.set(page.id, item);
     this.order.push(page.id);
     const kids = await this.fetchContent(item);
-    kids.forEach((c, i) => push({ kind: c.kind, id: c.id, parent: page.id, inline: c.inline, pos: i, depth: it.depth }));
+    this.pushKids(kids, page.id, push, it.depth);
+  }
+
+  /** Queues child pages/databases found in a body. Sync mode only queues new ones (changed ones come from search). */
+  private pushKids(kids: { kind: 'page' | 'database'; id: string; inline: boolean }[], parent: string, push: (e: QueueEntry) => void, depth?: number) {
+    kids.forEach((c, i) => {
+      const m = this.sync ? this.mapped.get(c.id) : undefined;
+      if (m && !m.deleted) {
+        this.positions.set(c.id, i);
+        return;
+      }
+      push({ kind: c.kind, id: c.id, parent, inline: c.inline, pos: i, depth });
+    });
   }
 
   private async discoverDatabase(id: string, parent: string | null, inline: boolean, push: (e: QueueEntry) => void, pos?: number) {
@@ -489,11 +736,13 @@ export class NotionImport {
       const sourceDsId = views.find((v) => v.data_source_id)?.data_source_id;
       if (!sourceDsId) { this.warn('linked_database', `Linked database "${plain(db.title)}" has no readable source`, id); return; }
       this.linked.set(id, { sourceDsId, views, parent });
-      if (!this.dataSources.has(sourceDsId)) {
+      if (!this.dataSources.has(sourceDsId) && !this.atrium.has(sourceDsId)) {
         try {
           const src = await this.client.dataSource(sourceDsId);
           const srcDb = src.parent?.database_id;
-          if (srcDb) push({ kind: 'database', id: srcDb, parent: null });
+          const known = this.sync && srcDb ? this.mapped.get(srcDb) : undefined;
+          if (known && !known.deleted) this.atrium.set(sourceDsId, { id: known.id, title: known.title });
+          else if (srcDb) push({ kind: 'database', id: srcDb, parent: null });
         } catch (e: any) {
           this.warn('linked_database', `Source of linked database "${plain(db.title)}" isn't shared with the integration`, id);
         }
@@ -507,7 +756,9 @@ export class NotionImport {
       const cap = this.opts.maxRowsPerSource;
       // Queries can also return data_source objects (databases that live inside row pages); those are found when
       // the row's body is read, so keep only real rows here.
-      let rows = (await this.client.queryDataSource(dsRef.id, cap ? cap + 1 : Infinity)).filter(
+      // Sync: rows of an already-imported database arrive individually (search), so only schema/views/templates are re-read.
+      const known = this.sync && (this.mapped.has(i === 0 ? db.id : ds.id) && !this.mapped.get(i === 0 ? db.id : ds.id)!.deleted);
+      let rows = (known ? [] : await this.client.queryDataSource(dsRef.id, cap ? cap + 1 : Infinity)).filter(
         (r: any) => (r.object ?? 'page') === 'page' && !r.archived && !r.is_archived && !r.in_trash,
       );
       if (cap && rows.length > cap) {
@@ -523,7 +774,7 @@ export class NotionImport {
       this.dataSources.set(ds.id, { id: ds.id, databaseId: db.id, raw: ds, rows, templates });
       const key = i === 0 ? db.id : ds.id;
       const title = i === 0 ? plain(db.title) || plain(ds.title) : `${plain(db.title)} – ${plain(ds.title) || dsRef.name || 'Source ' + (i + 1)}`;
-      const item: Item = { kind: 'database', notionId: key, raw: { ...db, _dataSource: ds }, parent, dataSourceId: ds.id, title, order: pos ?? this.order.length, inline };
+      const item: Item = { kind: 'database', notionId: key, raw: { ...db, _dataSource: ds }, parent, dataSourceId: ds.id, title, order: pos ?? (this.sync ? -1 : this.order.length), inline };
       this.items.set(key, item);
       this.order.push(key);
       for (const p of Object.values(ds.properties ?? {}) as any[]) this.tally('propertyTypes', p.type);
@@ -536,7 +787,7 @@ export class NotionImport {
       await mapLimit(rowItems, this.opts.concurrency ?? 4, async (ri) => {
         if (ri.raw.has_children === false) return;
         const kids = await this.fetchContent(ri);
-        kids.forEach((c, i) => push({ kind: c.kind, id: c.id, parent: ri.notionId, inline: c.inline, pos: i }));
+        this.pushKids(kids, ri.notionId, push);
       });
       for (const [ti, t] of templates.entries()) {
         try {
@@ -716,12 +967,12 @@ export class NotionImport {
     const ids = [...this.items.keys(), ...this.dataSources.keys()];
     if (!ids.length) return;
     const rows = await q(
-      `select m.source_id, m.atrium_id, m.source_last_edited from import_mappings m
+      `select m.source_id, m.atrium_id, m.source_last_edited, m.updated_at as synced_at from import_mappings m
        join pages p on p.id = m.atrium_id and p.deleted_at is null
        where m.source = 'notion' and m.source_id = any($1::text[])`,
       [ids],
     );
-    for (const r of rows) this.existing.set(r.source_id, { atrium_id: r.atrium_id, source_last_edited: r.source_last_edited });
+    for (const r of rows) this.existing.set(r.source_id, { atrium_id: r.atrium_id, source_last_edited: r.source_last_edited, synced_at: r.synced_at });
   }
 
   async recordMapping(sourceId: string, atriumId: string, kind: string, lastEdited: string | null) {
@@ -853,8 +1104,18 @@ export class NotionImport {
     }
   }
 
-  private async writeDoc(atriumId: string, blocks: any[], isNew: boolean) {
+  private async writeDoc(atriumId: string, blocks: any[], isNew: boolean, nid?: string) {
     const doc = this.toDoc(blocks.length ? blocks : [{ type: 'paragraph', content: [], children: [] }]);
+    // Sync: someone edited the Atrium copy since the last sync — keep their version in page history before Notion's replaces it.
+    const synced = nid ? this.existing.get(nid)?.synced_at : null;
+    if (this.sync && !isNew && synced) {
+      await q(
+        `insert into page_versions(page_id, ydoc, title, created_by)
+         select c.page_id, c.ydoc, p.title, p.updated_by from page_content c join pages p on p.id = c.page_id
+         where c.page_id = $1 and c.updated_at > $2::timestamptz + interval '5 seconds'`,
+        [atriumId, synced],
+      );
+    }
     if (!isNew && hocuspocus.documents.has(atriumId)) await replaceDocContent(atriumId, doc);
     await persistDoc(atriumId, doc, this.admin.id);
   }
@@ -863,7 +1124,11 @@ export class NotionImport {
     if (this.opts.force) return true;
     const ex = this.existing.get(notionId);
     if (!ex) return true;
-    return !ex.source_last_edited || !lastEdited || new Date(ex.source_last_edited).getTime() !== new Date(lastEdited).getTime();
+    if (!ex.source_last_edited || !lastEdited) return true;
+    const le = new Date(lastEdited).getTime();
+    if (new Date(ex.source_last_edited).getTime() !== le) return true;
+    // Same (minute-rounded) stamp: changed if we read it within that minute.
+    return !ex.synced_at || new Date(ex.synced_at).getTime() < le + SAME_MINUTE_MS;
   }
 
   /** Creates (or reuses) the Atrium teamspaces named in opts.teamspaces and records which roots go where. */
@@ -936,14 +1201,21 @@ export class NotionImport {
 
   /** Where an item goes: the nearest mapped ancestor (or itself) decides — a teamspace, or an owner's Private section. */
   placementFor(nid: string): { teamspaceId: string | null; ownerId: string | null } {
+    const stored = (m?: Mapped) => (m && !m.deleted ? { teamspaceId: m.teamspaceId, ownerId: m.teamspaceId ? null : m.ownerId } : null);
     let cur: string | null = nid;
     for (let i = 0; cur && i < 200; i++) {
       if (this.rootOwner.has(cur)) return { teamspaceId: null, ownerId: this.rootOwner.get(cur) || null };
       const ts = this.rootTeamspace.get(cur);
       if (ts) return { teamspaceId: ts, ownerId: null };
+      if (this.sync) {
+        // Sync: an imported ancestor (or the item itself, when its parent didn't change) keeps its current place.
+        const it = this.items.get(cur);
+        const here = stored(this.mapped.get(cur));
+        if (!it || !it.parent) { if (here) return here; break; }
+      }
       cur = this.items.get(cur)?.parent ?? null;
     }
-    return { teamspaceId: this.opts.targetTeamspaceId, ownerId: null };
+    return (this.sync && stored(this.mapped.get(nid))) || { teamspaceId: this.opts.targetTeamspaceId, ownerId: null };
   }
 
   teamspaceFor(nid: string): string | null {
@@ -964,7 +1236,7 @@ export class NotionImport {
       if (this.currentPage) this.noteRef(nid, this.currentPage);
       return null;
     }
-    const kind = this.items.get(nid)?.kind === 'database' ? ('database' as const) : ('page' as const);
+    const kind = (this.items.get(nid)?.kind ?? this.mapped.get(nid)?.kind) === 'database' ? ('database' as const) : ('page' as const);
     return { kind, id: p.id, title: p.title };
   };
 
@@ -1042,11 +1314,13 @@ export class NotionImport {
       const kind = it.kind === 'template' ? 'row' : it.kind;
       const ex = this.existing.get(nid);
       const bucket = it.kind === 'database' ? 'databases' : it.kind === 'row' || it.kind === 'template' ? 'rows' : 'pages';
+      // Sync: unknown order (-1) keeps the current position, or appends a new item.
+      const pos = it.order >= 0 ? it.order : this.positions.get(nid) ?? null;
       if (ex) {
         await q(
-          `update pages set title = $2, parent_id = coalesce($3, parent_id), position = $4, is_template = $5, teamspace_id = $6,
+          `update pages set title = $2, parent_id = coalesce($3, parent_id), position = coalesce($4, position), is_template = $5, teamspace_id = $6,
              owner_id = case when $6::uuid is null then $7::uuid else owner_id end where id = $1`,
-          [ex.atrium_id, it.title, parentAtrium, it.order, it.kind === 'template', ts, owner],
+          [ex.atrium_id, it.title, parentAtrium, pos, it.kind === 'template', ts, owner],
         );
         this.atrium.set(nid, { id: ex.atrium_id, title: it.title });
         if (!this.changed(nid, it.raw.last_edited_time)) this.counts[bucket].skipped++;
@@ -1054,8 +1328,9 @@ export class NotionImport {
       } else {
         const row = await one<{ id: string }>(
           `insert into pages(workspace_id, parent_id, teamspace_id, owner_id, kind, title, position, is_template, created_by, updated_by)
-           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) returning id`,
-          [ws, parentAtrium, ts, owner, kind, it.title, it.order, it.kind === 'template', this.admin.id],
+           values ($1,$2,$3,$4,$5,$6,coalesce($7, (select coalesce(max(position), -1) + 1 from pages
+             where workspace_id = $1 and parent_id is not distinct from $2::uuid and teamspace_id is not distinct from $3::uuid)),$8,$9,$9) returning id`,
+          [ws, parentAtrium, ts, owner, kind, it.title, pos, it.kind === 'template', this.admin.id],
         );
         this.atrium.set(nid, { id: row!.id, title: it.title });
         await this.recordMapping(nid, row!.id, it.kind, null);
@@ -1063,7 +1338,13 @@ export class NotionImport {
         if (it.kind === 'template') this.counts.templates++;
       }
       if (it.kind === 'database' && it.dataSourceId) this.atrium.set(it.dataSourceId, this.atrium.get(nid)!);
-      if (!it.parent) this.roots.push({ id: this.atrium.get(nid)!.id, title: it.title || 'Untitled', kind: it.kind, teamspaceId: ts ?? undefined, ...(ts ? {} : { ownerId: owner }) });
+      if (!it.parent && !(this.sync && ex)) this.roots.push({ id: this.atrium.get(nid)!.id, title: it.title || 'Untitled', kind: it.kind, teamspaceId: ts ?? undefined, ...(ts ? {} : { ownerId: owner }) });
+    }
+
+    // Sync: re-read parents give the current order of their (unchanged) children.
+    for (const [nid, pos] of this.positions) {
+      const a = this.items.has(nid) ? null : this.atrium.get(nid);
+      if (a) await q(`update pages set position = $2 where id = $1`, [a.id, pos]);
     }
 
     // ---- schemas (after every database exists, so relations resolve)
@@ -1118,6 +1399,11 @@ export class NotionImport {
         };
       }
       if ((it.kind === 'row' || it.kind === 'template') && it.dataSourceId) {
+        if (!schemas.has(it.dataSourceId)) {
+          const db = it.parent ? this.atrium.get(it.parent) : undefined;
+          const stored = db ? await one<{ schema: any[] }>(`select schema from databases where page_id = $1`, [db.id]) : undefined;
+          schemas.set(it.dataSourceId, stored?.schema ?? []);
+        }
         const r = await convertRowProps(it.dataSourceId, it.raw.properties ?? {}, schemas.get(it.dataSourceId) ?? [], ctx, async (propNotionId) => {
           const items = await this.client.pageProperty(it.notionId, propNotionId);
           return items.map((x: any) => x.relation?.id).filter(Boolean);
@@ -1130,7 +1416,7 @@ export class NotionImport {
       );
       let blocks = await this.bodyBlocks(it);
       if (it.inlineComments?.size) blocks = await this.anchorInlineComments(it, atriumId, blocks);
-      await this.writeDoc(atriumId, blocks, isNew);
+      await this.writeDoc(atriumId, blocks, isNew, nid);
     }
     this.currentPage = null;
 

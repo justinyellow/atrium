@@ -152,6 +152,28 @@ export class NotionClient {
   search(objectType: 'page' | 'data_source') {
     return this.paginate('POST', '/search', { filter: { property: 'object', value: objectType } });
   }
+  /**
+   * Objects edited since `since` (newest first, stops paging at the first older one); null lists everything.
+   * `keep` sees every object and decides which are returned (so a full listing needn't be held in memory).
+   */
+  async searchSince(objectType: 'page' | 'data_source', since: Date | null, keep: (o: any) => boolean = () => true): Promise<any[]> {
+    const out: any[] = [];
+    let cursor: string | undefined;
+    do {
+      const res: any = await this.request('POST', '/search', {
+        filter: { property: 'object', value: objectType },
+        sort: { timestamp: 'last_edited_time', direction: 'descending' },
+        page_size: 100,
+        ...(cursor ? { start_cursor: cursor } : {}),
+      });
+      for (const r of res.results ?? []) {
+        if (since && r.last_edited_time && new Date(r.last_edited_time) < since) return out;
+        if (keep(r)) out.push(r);
+      }
+      cursor = res.has_more ? res.next_cursor ?? undefined : undefined;
+    } while (cursor);
+    return out;
+  }
   page(id: string) {
     return this.request('GET', `/pages/${id}`);
   }

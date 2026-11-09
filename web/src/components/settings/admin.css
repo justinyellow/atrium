@@ -41,3 +41,13 @@
 .imp-warn ul { margin: 0 0 8px; padding-left: 18px; font-size: 12px; color: var(--text-2); }
 .spin { animation: spin 0.8s linear infinite; }
 @media (max-width: 700px) { .imp-counts { grid-template-columns: repeat(2, 1fr); } .imp-roots { columns: 1; } }
+.imp-pill { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--bg-hover); color: var(--text-2); flex-shrink: 0; }
+.imp-pill.active { background: var(--c-green-bg); color: var(--c-green); }
+.imp-pill.running { background: var(--c-blue-bg); color: var(--c-blue); }
+.imp-link-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 10px 0; font-size: 13px; }
+.imp-link-grid div { background: var(--bg-subtle); border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
+.imp-link-grid span { font-size: 12px; color: var(--text-2); }
+.imp-link-sched { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 13px; color: var(--text-2); }
+.imp-link-sched .select { height: 28px; margin-left: 4px; }
+.imp-unlink { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+@media (max-width: 640px) { .imp-link-grid { grid-template-columns: repeat(2, 1fr); } }
