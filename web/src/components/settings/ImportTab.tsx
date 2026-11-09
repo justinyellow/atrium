@@ -5,6 +5,18 @@ import { Download, ExternalLink, FileText, Link2, Loader2, Save, Square, Upload 
 import { get, post, put, queryClient } from '../../lib/api';
 import { useUi } from '../../lib/store';
 import { timeAgo, toast } from '../ui';
+
+/** Summary headings for grouped import warnings (expand a group to see every item). */
+const WARNING_LABELS: Record<string, string> = {
+  person_unmatched: 'People without an Atrium account — shown as plain names (choose “Add them as guests” to keep them)',
+  linked_database: 'Linked database views whose source database is not shared with the integration',
+  view_other_source: 'Views that show a different database (not supported yet — skipped)',
+  file_failed: 'Files that could not be copied',
+  block_rejected: 'Blocks that could not be converted (kept as a note)',
+  fetch_failed: 'Items Notion would not return',
+  limit: 'Items left out because of the import limits',
+  comments: 'Comments that could not be imported',
+};
 import './admin.css';
 
 interface Job {
@@ -102,7 +114,7 @@ function Report({ job, mapper }: { job: Job; mapper?: ReactNode }) {
           {kinds.map(([k, v]: any) => (
             <div key={k} className="imp-warn">
               <button className="imp-warn-head" onClick={() => setOpen(open === k ? null : k)}>
-                <span>{(byKind.get(k)?.[0]?.message ?? k).replace(/"[^"]*"/g, '…').slice(0, 90)}</span><span className="faint">{v}</span>
+                <span>{WARNING_LABELS[k] ?? (byKind.get(k)?.[0]?.message ?? k).replace(/"[^"]*"/g, '…').slice(0, 90)}</span><span className="faint">{v}</span>
               </button>
               {open === k && (
                 <ul>{(byKind.get(k) ?? []).slice(0, 100).map((w, i) => <li key={i}>{w.message}{w.page ? <span className="faint"> — in “{w.page}”</span> : null}</li>)}</ul>
@@ -181,7 +193,7 @@ function TeamspaceMapper({ roots, assign, setAssign, names, privateNames, addNam
           <div key={k || 'top'} className="imp-warn">
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <button className="imp-warn-head" style={{ flex: 1 }} onClick={() => setOpen(open === k ? null : k)}>
-                <span>{k.startsWith('private:') ? `🔒 Private pages of ${k.slice(8).replace(/^Private — /, '')}` : k ? `Under a page not shared with the integration · ${list.slice(0, 3).map((r) => r.title).join(', ')}${list.length > 3 ? ', …' : ''}` : 'Top level of the workspace'}</span>
+                <span>{k.startsWith('private:') ? `🔒 Private pages of ${k.slice(8).replace(/^Private — /, '')}` : k ? `Under a page outside this import · ${list.slice(0, 3).map((r) => r.title).join(', ')}${list.length > 3 ? ', …' : ''}` : 'Top level of the workspace'}</span>
                 <span className="faint">{list.length}</span>
               </button>
               <select className="select" style={{ height: 28, maxWidth: 200 }} value={values.size === 1 ? [...values][0] : '__mixed'} onChange={(e) => e.target.value !== '__mixed' && setMany(list.map((r) => r.notionId), e.target.value)}>
