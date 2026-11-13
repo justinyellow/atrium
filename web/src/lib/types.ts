@@ -188,6 +188,7 @@ export interface Row {
   created_by: string | null;
   updated_by: string | null;
   computed: Record<string, any>;
+  subpages?: number;
 }
 
 export interface QueryResult {

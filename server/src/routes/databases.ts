@@ -529,7 +529,9 @@ export async function queryDatabase(
 ) {
   const schema = await getSchema(dbId);
   const rows = await q<Row>(
-    `select ${PAGE_COLS} from pages where parent_id = $1 and kind = 'row' and deleted_at is null and is_template = $2
+    `select ${PAGE_COLS}, (select count(*)::int from pages c where c.parent_id = pages.id and c.kind in ('page', 'database')
+       and c.deleted_at is null) as subpages
+     from pages where parent_id = $1 and kind = 'row' and deleted_at is null and is_template = $2
      order by position, created_at`,
     [dbId, !!opts.includeTemplates],
   );
@@ -560,7 +562,7 @@ export async function queryDatabase(
     rows: out.map((r) => ({
       id: r.id, title: r.title, icon: r.icon, cover: r.cover, props: r.props, position: r.position,
       created_at: r.created_at, updated_at: r.updated_at, created_by: r.created_by, updated_by: r.updated_by,
-      computed: ctx.computed.get(r.id) ?? {},
+      computed: ctx.computed.get(r.id) ?? {}, subpages: r.subpages ?? 0,
     })),
     titles: Object.fromEntries(ctx.titles),
   };

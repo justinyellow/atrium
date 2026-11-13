@@ -94,11 +94,16 @@ export interface TreePage {
   level?: Level;
 }
 
-/** Computes effective access for every (non-row, non-deleted) page in the workspace in one pass. */
+/**
+ * Computes effective access for every non-deleted page in the workspace in one pass. Rows are left out
+ * unless they hold sub-pages, so those pages nest under their row instead of becoming roots.
+ */
 export async function visibleTree(user: AuthUser): Promise<TreePage[]> {
   const pages = await q<TreePage>(
     `select id, parent_id, teamspace_id, owner_id, kind, title, icon, position
-     from pages where workspace_id = $1 and deleted_at is null and kind not in ('row', 'synced') and not is_template
+     from pages p where workspace_id = $1 and deleted_at is null and not is_template
+       and (kind in ('page', 'database') or (kind = 'row' and exists (
+         select 1 from pages c where c.parent_id = p.id and c.kind in ('page', 'database') and c.deleted_at is null)))
      order by position, created_at`,
     [user.workspaceId],
   );

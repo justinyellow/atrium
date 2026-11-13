@@ -7,7 +7,7 @@ import { AddPropertyButton, HeaderMenu, PropertySettings } from './PropertyMenu'
 import {
   CALC_SHORT, calcsFor, calculate, createRow, groupRows, groupValue, propsConfig, updateView, viewProps, type Group,
 } from './dbutil';
-import { RowMenuButton, reorderRows, type ViewProps } from './shared';
+import { RowMenuButton, SubpageCount, reorderRows, type ViewProps } from './shared';
 import { Check } from 'lucide-react';
 
 export function TableView(vp: ViewProps) {
@@ -176,6 +176,7 @@ function TableRow({ vp, row, visible, w }: {
             <span className="title-inner">
               {row.icon && <PageIcon icon={row.icon} size={16} />}
               <span className={`cell-val title ${view.config.wrap ? 'wrap' : ''}`}>{row.title || <span className="faint">Untitled</span>}</span>
+              <SubpageCount n={row.subpages} />
             </span>
             <button className="row-open" onClick={(e) => { e.stopPropagation(); openRow(row.id); }}><PanelRight size={12} /> OPEN</button>
           </EditableCell>
