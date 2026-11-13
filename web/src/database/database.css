@@ -475,3 +475,4 @@ select.input { padding-right: 4px; }
 /* page verification badge (wiki "Verified") */
 .page-verification { display: flex; align-items: center; gap: 8px; margin: 2px 0 8px; font-size: 13px; color: var(--text-2); }
 .page-verification button.verif-badge { cursor: pointer; }
+.subpage-count { display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0; color: var(--text-3); font-size: 12px; font-weight: 400; }

@@ -23,6 +23,7 @@ export async function createPageAndOpen(nav: (p: string) => void, body: { parent
 
 type DropPos = 'before' | 'after' | 'inside';
 let dragId: string | null = null;
+const DB_ROWS_SHOWN = 10;
 
 function useChildren(tree: Tree | undefined) {
   return useMemo(() => {
@@ -104,15 +105,22 @@ function TreeItem({ page, depth, children, siblings, favorites }: { page: TreePa
   const [renaming, setRenaming] = useState(false);
   const [drop, setDrop] = useState<DropPos | null>(null);
   const menuBtn = useRef<HTMLButtonElement>(null);
+  const [showAll, setShowAll] = useState(false);
   const kids = children.get(page.id) ?? [];
   const canEdit = page.level === 'edit' || page.level === 'full';
+  const isDb = page.kind === 'database';
+  const isRow = page.kind === 'row';
+  // A database only expands to list the rows that hold sub-pages; it has none otherwise.
+  const expandable = !isDb || kids.length > 0;
+  const shown = isDb && !showAll ? kids.slice(0, DB_ROWS_SHOWN) : kids;
 
   const onDragOver = (e: DragEvent) => {
     if (!dragId || dragId === page.id) return;
     e.preventDefault();
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const y = e.clientY - r.top;
-    setDrop(y < r.height * 0.25 ? 'before' : y > r.height * 0.75 ? 'after' : page.kind === 'database' ? 'after' : 'inside');
+    // Rows can't take siblings from the sidebar (that would drop a page into the database itself).
+    setDrop(isRow ? 'inside' : y < r.height * 0.25 ? 'before' : y > r.height * 0.75 ? 'after' : isDb ? 'after' : 'inside');
   };
   return (
     <>
@@ -120,7 +128,7 @@ function TreeItem({ page, depth, children, siblings, favorites }: { page: TreePa
         className={`tree-item ${activeId === page.id ? 'active' : ''} ${menu ? 'menu-open' : ''} ${drop ? `drop-${drop}` : ''}`}
         style={{ paddingLeft: 8 + depth * 12 }}
         onClick={() => nav(`/p/${page.id}`)}
-        draggable={!renaming}
+        draggable={!renaming && !isRow}
         onDragStart={(e) => { dragId = page.id; e.dataTransfer.effectAllowed = 'move'; }}
         onDragEnd={() => { dragId = null; }}
         onDragOver={onDragOver}
@@ -128,8 +136,8 @@ function TreeItem({ page, depth, children, siblings, favorites }: { page: TreePa
         onDrop={(e) => { e.preventDefault(); const d = drop; setDrop(null); if (dragId && d) movePage(dragId, page, d, siblings); }}
       >
         <span
-          className={`tree-icon-wrap ${page.kind !== 'database' ? 'has-toggle' : ''}`}
-          onClick={(e) => { if (page.kind === 'database') return; e.stopPropagation(); toggle(page.id); }}
+          className={`tree-icon-wrap ${expandable ? 'has-toggle' : ''}`}
+          onClick={(e) => { if (!expandable) return; e.stopPropagation(); toggle(page.id); }}
         >
           <span className="ico"><PageIcon icon={page.icon} kind={page.kind} /></span>
           <span className="chev tree-toggle"><ChevronRight size={14} style={{ transform: expanded ? 'rotate(90deg)' : undefined, transition: 'transform 120ms' }} /></span>
@@ -145,16 +153,21 @@ function TreeItem({ page, depth, children, siblings, favorites }: { page: TreePa
           <span className="tree-title">{page.title || 'Untitled'}</span>
         )}
         <span className="tree-actions" onClick={(e) => e.stopPropagation()}>
-          <button ref={menuBtn} className="icon-btn" title="Delete, duplicate, and more…" onClick={() => setMenu(true)}><MoreHorizontal size={16} /></button>
-          {canEdit && page.kind !== 'database' && (
+          {!isRow && <button ref={menuBtn} className="icon-btn" title="Delete, duplicate, and more…" onClick={() => setMenu(true)}><MoreHorizontal size={16} /></button>}
+          {canEdit && !isDb && (
             <button className="icon-btn" title="Add a page inside" onClick={() => createPageAndOpen(nav, { parentId: page.id })}><Plus size={16} /></button>
           )}
         </span>
       </div>
       {menu && <PageMenu page={page} anchor={menuBtn.current} onClose={() => setMenu(false)} onRename={() => setRenaming(true)} favorite={favorites.has(page.id)} />}
-      {expanded && page.kind !== 'database' && (
-        kids.length ? kids.map((k) => <TreeItem key={k.id} page={k} depth={depth + 1} children={children} siblings={kids} favorites={favorites} />)
+      {expanded && expandable && (
+        kids.length ? shown.map((k) => <TreeItem key={k.id} page={k} depth={depth + 1} children={children} siblings={kids} favorites={favorites} />)
           : <div className="tree-empty" style={{ paddingLeft: 30 + depth * 12 }}>No pages inside</div>
+      )}
+      {expanded && shown.length < kids.length && (
+        <div className="tree-empty tree-more" style={{ paddingLeft: 30 + depth * 12 }} onClick={() => setShowAll(true)}>
+          {kids.length - shown.length} more with pages inside
+        </div>
       )}
     </>
   );

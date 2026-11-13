@@ -4,7 +4,7 @@ import type { Prop, Row } from '../lib/types';
 import { MenuItem, PageIcon, Popover } from '../components/ui';
 import { CellValue } from './cells';
 import { canGroupWrite, createRow, GROUPABLE, groupRows, groupValue, isEmptyValue, rowValue, setRowValue, updateView, viewProps } from './dbutil';
-import { reorderRows, type ViewProps } from './shared';
+import { SubpageCount, reorderRows, type ViewProps } from './shared';
 import { GroupLabel } from './TableView';
 
 export function Card({ vp, row, showCover }: { vp: ViewProps; row: Row; showCover?: boolean }) {
@@ -17,6 +17,7 @@ export function Card({ vp, row, showCover }: { vp: ViewProps; row: Row; showCove
         <div className="card-title">
           {row.icon && <PageIcon icon={row.icon} size={16} />}
           <span>{row.title || <span className="faint">Untitled</span>}</span>
+          <SubpageCount n={row.subpages} />
         </div>
         {props.map((x) => isEmptyValue(rowValue(row, x.prop)) && x.prop.type !== 'checkbox' ? null : (
           <div key={x.prop.id} className="card-prop"><CellValue prop={x.prop} row={row} users={users} titles={titles} wrap /></div>

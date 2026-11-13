@@ -343,3 +343,24 @@ test('REST + MCP upload-from-url refuse internal addresses', async (t) => {
   assert.equal((await api('POST', '/files/from-url', {})).status, 400);
   await assert.rejects(mcp('upload-file-from-url', { url: 'http://127.0.0.1:3100/api/v1/health' }), /not allowed/);
 });
+
+test('pages inside a row nest under it in the tree; rows without pages stay out; rows report a sub-page count', async (t) => {
+  if (!serverUp) return t.skip('server not running');
+  const db = (await api('POST', '/pages', { kind: 'database', title: `${tag} subpages` })).data;
+  created.push(db.id);
+  const withKids = (await api('POST', `/databases/${db.id}/rows`, { title: 'has pages' })).data;
+  const plain = (await api('POST', `/databases/${db.id}/rows`, { title: 'no pages' })).data;
+  const sub = (await api('POST', '/pages', { parentId: withKids.id, title: `${tag} spec` })).data;
+  await api('POST', '/pages', { parentId: withKids.id, title: `${tag} rollout` });
+
+  const tree = (await api('GET', '/tree')).data.pages as any[];
+  const byId = new Map(tree.map((p) => [p.id, p]));
+  assert.equal(byId.get(sub.id)?.parent_id, withKids.id, 'sub-page keeps its row as parent');
+  assert.equal(byId.get(withKids.id)?.parent_id, db.id, 'row with pages is in the tree under its database');
+  assert.equal(byId.get(withKids.id)?.level, byId.get(db.id)?.level, 'row inherits the database access level');
+  assert.ok(!byId.has(plain.id), 'rows without pages are left out');
+
+  const rows = (await api('POST', `/databases/${db.id}/query`, {})).data.rows as any[];
+  assert.equal(rows.find((r) => r.id === withKids.id).subpages, 2);
+  assert.equal(rows.find((r) => r.id === plain.id).subpages, 0);
+});

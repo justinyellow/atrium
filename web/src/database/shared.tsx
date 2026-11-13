@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Copy, ExternalLink, GripVertical, PanelRight, Trash2 } from 'lucide-react';
+import { Copy, ExternalLink, FileText, GripVertical, PanelRight, Trash2 } from 'lucide-react';
 import type { Database, DbView, Row, User } from '../lib/types';
 import { del, post, queryClient } from '../lib/api';
 import { MenuItem, Popover, toast } from '../components/ui';
@@ -59,4 +59,14 @@ export async function reorderRows(dbId: string, allRows: Row[], dragId: string, 
     return { ...old, rows: [...ordered, ...rest] };
   });
   await post(`/databases/${dbId}/rows/reorder`, { order: ids });
+}
+
+/** Shown next to a row's title when the row holds pages of its own. */
+export function SubpageCount({ n }: { n?: number }) {
+  if (!n) return null;
+  return (
+    <span className="subpage-count" title={`${n} ${n === 1 ? 'page' : 'pages'} inside`}>
+      <FileText size={12} strokeWidth={1.8} />{n}
+    </span>
+  );
 }

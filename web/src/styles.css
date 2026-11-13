@@ -152,6 +152,8 @@ a { color: inherit; }
 }
 .icon-btn:hover { background: var(--bg-active); color: var(--text-2); }
 .tree-empty { padding: 0 8px; height: 28px; display: flex; align-items: center; color: var(--text-3); font-size: 13px; }
+.tree-more { cursor: pointer; }
+.tree-more:hover { color: var(--text-2); }
 .sidebar-bottom { padding: 4px 8px 8px; border-top: 1px solid var(--border); }
 
 /* ---------- topbar ---------- */
