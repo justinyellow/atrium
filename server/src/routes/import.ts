@@ -197,6 +197,7 @@ export default async function importRoutes(app: FastifyInstance) {
       createdAt: l.created_at,
       createdByName: l.created_by_name,
       teamspaceName: l.teamspace_name,
+      targetTeamspaceId: o.targetTeamspaceId ?? null,
       peopleMode: o.peopleMode,
       roots: (o.rootIds ?? []).length,
       mappedTeamspaces: (o.teamspaces ?? []).length,
@@ -251,7 +252,7 @@ export default async function importRoutes(app: FastifyInstance) {
     const r = await one<{ value: any; updated_at: string }>(`select value, updated_at from import_settings where workspace_id = $1 and source = 'notion' and key = 'teamspace-map'`, [admin.workspaceId]);
     return r ? { ...r.value, updatedAt: r.updated_at } : { teamspaces: [] };
   });
-  app.put<{ Body: { teamspaces?: TeamspaceSpec[] } }>('/admin/import/notion/teamspace-map', async (req) => {
+  app.put<{ Body: { teamspaces?: TeamspaceSpec[]; targetTeamspaceId?: string } }>('/admin/import/notion/teamspace-map', async (req) => {
     const admin = requireAdmin(req);
     const teamspaces = sanitizeTeamspaces(req.body?.teamspaces) ?? [];
     await q(
@@ -259,8 +260,23 @@ export default async function importRoutes(app: FastifyInstance) {
        on conflict (workspace_id, source, key) do update set value = excluded.value, updated_at = now()`,
       [admin.workspaceId, JSON.stringify({ teamspaces })],
     );
-    await audit({ workspaceId: admin.workspaceId, actorId: admin.id, action: 'import.teamspace_map_saved', targetType: 'import', meta: { teamspaces: teamspaces.length }, ip: req.ip });
-    return { teamspaces };
+    // When Notion is already linked, the saved map is the source of truth for the recurring sync:
+    // push it into the live link options so edits take effect on the next sync without re-importing.
+    let appliedToLink = false;
+    const link = await one<{ options: any }>(`select options from notion_links where workspace_id = $1`, [admin.workspaceId]);
+    if (link) {
+      const options = { ...(link.options ?? {}), teamspaces };
+      const target = req.body?.targetTeamspaceId;
+      if (target) {
+        const ts = await one(`select id from teamspaces where id = $1 and workspace_id = $2`, [target, admin.workspaceId]);
+        if (!ts) fail(400, 'That catch-all teamspace does not exist');
+        options.targetTeamspaceId = target;
+      }
+      await q(`update notion_links set options = $2, updated_at = now() where workspace_id = $1`, [admin.workspaceId, JSON.stringify(options)]);
+      appliedToLink = true;
+    }
+    await audit({ workspaceId: admin.workspaceId, actorId: admin.id, action: 'import.teamspace_map_saved', targetType: 'import', meta: { teamspaces: teamspaces.length, appliedToLink }, ip: req.ip });
+    return { teamspaces, appliedToLink };
   });
 
   /** Rewrites links in previously imported pages that still point at Notion, now that more is imported. */

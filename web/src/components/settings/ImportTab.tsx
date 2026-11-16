@@ -359,6 +359,8 @@ export function ImportTab() {
   const [tsMeta, setTsMeta] = useState<Record<string, Omit<TsSpec, 'rootIds' | 'name'>>>({});
   const [privatePages, setPrivatePages] = useState<'owner' | 'skip'>('owner');
   const [keepInSync, setKeepInSync] = useState(false);
+  // Catch-all teamspace for the live link: unmapped roots land here on each sync.
+  const [catchall, setCatchall] = useState('');
   const linked = useQuery({ queryKey: ['notion-link'], queryFn: () => get<any>('/admin/import/notion/link') });
   const fileRef = useRef<HTMLInputElement>(null);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -374,6 +376,9 @@ export function ImportTab() {
   useEffect(() => {
     if (!teamspace && teamspaces.data?.length) setTeamspace(teamspaces.data[0].id);
   }, [teamspaces.data, teamspace]);
+  useEffect(() => {
+    if (!catchall && linked.data?.targetTeamspaceId) setCatchall(linked.data.targetTeamspaceId);
+  }, [linked.data, catchall]);
   const loadMap = (specs: TsSpec[]) => {
     const a: Record<string, string> = {};
     const meta: Record<string, Omit<TsSpec, 'rootIds' | 'name'>> = {};
@@ -400,8 +405,9 @@ export function ImportTab() {
   };
   const saveMap = async () => {
     try {
-      await put('/admin/import/notion/teamspace-map', { teamspaces: specs() });
-      toast('Teamspace map saved');
+      const r = await put<{ appliedToLink?: boolean }>('/admin/import/notion/teamspace-map', { teamspaces: specs(), targetTeamspaceId: catchall || undefined });
+      toast(r.appliedToLink ? 'Teamspace map saved and applied to the live sync' : 'Teamspace map saved');
+      if (r.appliedToLink) queryClient.invalidateQueries({ queryKey: ['notion-link'] });
     } catch (e: any) {
       toast(e.message);
     }
@@ -503,6 +509,16 @@ export function ImportTab() {
           <option value={2}>Yes, up to two links away</option>
         </select>
         <label className="adm-label">Teamspace map <span className="faint">({Object.keys(assign).length} items assigned to {new Set(Object.values(assign)).size} teamspaces)</span></label>
+        {linked.data?.linked && (
+          <div style={{ margin: '4px 0 8px' }}>
+            <label className="adm-label" style={{ marginTop: 0 }}>Catch-all teamspace <span className="faint">(unmapped pages land here on every sync)</span></label>
+            <select className="select" style={{ width: '100%', height: 32 }} value={catchall} onChange={(e) => setCatchall(e.target.value)}>
+              <option value="">Keep current ({linked.data.teamspaceName ?? 'default'})</option>
+              {teamspaces.data?.map((t) => <option key={t.id} value={t.id}>{t.icon} {t.name}</option>)}
+            </select>
+            <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>Saving the map writes it straight to the live link, so the next scheduled sync uses it — no re-import needed.</div>
+          </div>
+        )}
         <div className="adm-actions" style={{ marginTop: 4, justifyContent: 'flex-start' }}>
           <button className="btn sm" onClick={() => fileRef.current?.click()}><Upload size={13} /> Upload map</button>
           <button className="btn sm" disabled={!Object.keys(assign).length} onClick={downloadMap}><Download size={13} /> Download map</button>
