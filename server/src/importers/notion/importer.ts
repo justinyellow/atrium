@@ -204,7 +204,18 @@ export class NotionImport {
   /** Fetches a block's children recursively (not into child pages/databases, which are separate items). */
   private async fetchTree(blockId: string, depth = 0): Promise<any[]> {
     this.check();
-    const blocks = await this.client.blockChildren(blockId);
+    let blocks: any[];
+    try {
+      blocks = await this.client.blockChildren(blockId);
+    } catch (e: any) {
+      // A block can be deleted or unshared between listing and fetch; skip it rather than failing the whole run.
+      if (e instanceof NotionApiError && (e.status === 404 || e.status === 403)) {
+        this.warn('block_missing', e.message, blockId);
+        this.children.set(blockId, []);
+        return [];
+      }
+      throw e;
+    }
     this.children.set(blockId, blocks);
     this.counts.blocks += blocks.length;
     if (depth > 40) return blocks;
