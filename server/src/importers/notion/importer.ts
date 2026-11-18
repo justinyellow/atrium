@@ -286,6 +286,20 @@ export class NotionImport {
    * pages/databases so discovery can recurse.
    */
   private async fetchContent(item: Item): Promise<{ kind: 'page' | 'database'; id: string; inline: boolean }[]> {
+    const cached = await this.cachedBody(item);
+    if (cached) {
+      this.counts.cachedPages = (this.counts.cachedPages ?? 0) + 1;
+      if (cached.md !== undefined) {
+        item.md = cached.md;
+        return this.childrenFromMarkdown(cached.md, item.notionId);
+      }
+      for (const [id, blocks] of Object.entries(cached.tree ?? {})) {
+        this.children.set(id, blocks);
+        this.counts.blocks += blocks.length;
+      }
+      this.refsFromBlocks(item.notionId);
+      return this.nestedChildren(item.notionId).map((c) => ({ kind: c.type === 'child_page' ? 'page' : 'database', id: c.id, inline: c.type === 'child_database' }));
+    }
     if (this.useMarkdown()) {
       try {
         const r = await this.client.pageMarkdown(item.notionId);
@@ -294,6 +308,7 @@ export class NotionImport {
         if (!reason) {
           item.md = md;
           this.counts.markdownPages = (this.counts.markdownPages ?? 0) + 1;
+          await this.cacheBody(item, { md });
           return this.childrenFromMarkdown(md, item.notionId);
         }
         this.counts.blockFallbacks = (this.counts.blockFallbacks ?? 0) + 1;
@@ -306,7 +321,79 @@ export class NotionImport {
     await this.fetchTree(item.notionId);
     this.refsFromBlocks(item.notionId);
     if (this.opts.includeInlineComments) await this.fetchInlineComments(item);
+    else await this.cacheBody(item, { tree: this.subtreeBlocks(item.notionId) });
     return this.nestedChildren(item.notionId).map((c) => ({ kind: c.type === 'child_page' ? 'page' : 'database', id: c.id, inline: c.type === 'child_database' }));
+  }
+
+  /** Every fetched block list under a page (stops at child pages/databases, like fetchTree). */
+  private subtreeBlocks(rootId: string) {
+    const tree: Record<string, any[]> = {};
+    const walk = (id: string) => {
+      const blocks = this.children.get(id);
+      if (!blocks) return;
+      tree[id] = blocks;
+      for (const b of blocks) if (b.has_children && b.type !== 'child_page' && b.type !== 'child_database') walk(b.id);
+    };
+    walk(rootId);
+    return tree;
+  }
+
+  // ---------------------------------------------------------------- discovery cache (resume after failure)
+
+  /** Body cached by an earlier, unfinished run, if the page hasn't changed in Notion since it was read. */
+  private async cachedBody(item: Item): Promise<{ md?: string; tree?: Record<string, any[]> } | null> {
+    const le = item.raw?.last_edited_time;
+    if (this.opts.force || this.opts.includeInlineComments || !le) return null;
+    const r = await one<{ body: any }>(
+      `select body from import_discovery_cache where workspace_id = $1 and source_id = $2 and last_edited = $3 and fetched_at >= $3::timestamptz + make_interval(secs => $4)`,
+      [this.admin.workspaceId, item.notionId, le, SAME_MINUTE_MS / 1000],
+    ).catch(() => undefined);
+    return r?.body ?? null;
+  }
+
+  private async cacheBody(item: Item, body: { md?: string; tree?: Record<string, any[]> }) {
+    const le = item.raw?.last_edited_time;
+    if (!le) return;
+    await q(
+      `insert into import_discovery_cache(workspace_id, source_id, last_edited, body) values ($1, $2, $3, $4)
+       on conflict (workspace_id, source_id) do update set last_edited = excluded.last_edited, body = excluded.body, fetched_at = now()`,
+      [this.admin.workspaceId, item.notionId, le, JSON.stringify(body)],
+    ).catch((e) => this.warn('cache', `Could not save discovery progress (${e.message})`, item.notionId));
+  }
+
+  /** Drops cached bodies: all of them once a run has written everything, or ones too old to be worth keeping. */
+  async clearDiscoveryCache(olderThanDays?: number) {
+    await q(
+      `delete from import_discovery_cache where workspace_id = $1 and ($2::int is null or fetched_at < now() - make_interval(days => $2::int))`,
+      [this.admin.workspaceId, olderThanDays ?? null],
+    ).catch(() => {});
+  }
+
+  /**
+   * Reads an item's body; when that fails (typically deleted or unshared in Notion while a long run was going),
+   * the item is left out of this run instead of failing the whole job. The next sync picks it up again.
+   */
+  private async readBody(item: Item) {
+    try {
+      return await this.fetchContent(item);
+    } catch (e: any) {
+      if (e?.code === 'cancelled' || this.cancelled || (e instanceof NotionApiError && e.status === 401)) throw e;
+      this.forget(item.notionId);
+      const name = item.title || 'Untitled';
+      if (e instanceof NotionApiError && e.status === 404) {
+        this.counts.vanished = (this.counts.vanished ?? 0) + 1;
+        this.warn('vanished', `"${name}" was deleted or unshared in Notion during the run; skipped`, item.notionId);
+      } else {
+        this.warn('fetch_failed', `Could not read "${name}" (${e.message}); skipped, the next sync retries it`, item.notionId);
+      }
+      return null;
+    }
+  }
+
+  private forget(nid: string) {
+    if (!this.items.delete(nid)) return;
+    const i = this.order.lastIndexOf(nid);
+    if (i >= 0) this.order.splice(i, 1);
   }
 
   /** Comments attached to blocks (not the page itself). One request per block that has text. */
@@ -537,10 +624,12 @@ export class NotionImport {
       this.order.push(p.id);
       rowItems.push(item);
     }
+    let rowsRead = 0;
     await mapLimit(rowItems, this.opts.concurrency ?? 4, async (ri) => {
       this.check();
-      const kids = await this.fetchContent(ri);
-      this.pushKids(kids, ri.notionId, push);
+      const kids = await this.readBody(ri);
+      if (kids) this.pushKids(kids, ri.notionId, push);
+      this.onProgress('rows', ++rowsRead, rowItems.length);
     });
     await this.drain(queue, push);
     for (const id of [...this.unresolved.keys()]) if (this.items.has(id) || this.atrium.has(id)) this.unresolved.delete(id);
@@ -703,8 +792,8 @@ export class NotionImport {
     const item: Item = { kind: 'page', notionId: page.id, raw: page, parent: it.parent, title: this.pageTitle(page), order: it.pos ?? (this.sync ? -1 : this.order.length), depth: it.depth ?? 0 };
     this.items.set(page.id, item);
     this.order.push(page.id);
-    const kids = await this.fetchContent(item);
-    this.pushKids(kids, page.id, push, it.depth);
+    const kids = await this.readBody(item);
+    if (kids) this.pushKids(kids, page.id, push, it.depth);
   }
 
   /** Queues child pages/databases found in a body. Sync mode only queues new ones (changed ones come from search). */
@@ -786,8 +875,8 @@ export class NotionImport {
       // Row bodies in parallel (each is one Markdown request, or a block-tree walk).
       await mapLimit(rowItems, this.opts.concurrency ?? 4, async (ri) => {
         if (ri.raw.has_children === false) return;
-        const kids = await this.fetchContent(ri);
-        this.pushKids(kids, ri.notionId, push);
+        const kids = await this.readBody(ri);
+        if (kids) this.pushKids(kids, ri.notionId, push);
       });
       for (const [ti, t] of templates.entries()) {
         try {
@@ -795,7 +884,7 @@ export class NotionImport {
           const tItem: Item = { kind: 'template', notionId: tp.id, raw: { ...tp, _isDefault: !!t.is_default }, parent: key, dataSourceId: ds.id, title: t.name ?? this.pageTitle(tp), order: ti };
           this.items.set(tp.id, tItem);
           this.order.push(tp.id);
-          await this.fetchContent(tItem);
+          await this.readBody(tItem);
         } catch (e: any) {
           this.warn('template', `Template "${t.name ?? t.id}" could not be read (${e.message})`, t.id);
         }

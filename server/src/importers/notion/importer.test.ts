@@ -551,6 +551,62 @@ test('sync: pulls edits, new pages and row changes; full check trashes deletions
   assert.equal(kept.report.counts.pages.created, 0, 'no duplicate of a page deleted in Atrium');
 });
 
+test('sync: a row deleted mid-run is skipped; a failed run resumes from cached bodies', async () => {
+  const ws = buildWorkspace();
+  const base = await run(ws);
+  assert.equal(base.status, 'done', base.error);
+  /** The fake API, except paths for which `fail` returns a status. */
+  const withFailures = (fail: (path: string) => number | null) => {
+    const inner = fakeNotionFetch(ws);
+    const fn: any = async (url: string, init: any) => {
+      const path = new URL(url).pathname.replace(/^\/v1/, '');
+      const s = fail(path);
+      if (!s) return inner(url, init);
+      inner.calls.push(`${init.method} ${path}`);
+      const body = { code: s === 404 ? 'object_not_found' : 'unauthorized', message: s === 404 ? 'Could not find block' : 'API token is invalid.' };
+      return { ok: false, status: s, headers: { get: () => null }, json: async () => body, text: async () => JSON.stringify(body) };
+    };
+    fn.calls = inner.calls;
+    return fn;
+  };
+  const sync = async (fetchImpl: any) => {
+    const { id, done } = await startNotionImport(
+      admin,
+      { token: 'secret_fake', targetTeamspaceId: tsId, peopleMode: 'guests' },
+      { fetchImpl, fileImporter: fakeFiles as any, minIntervalMs: 0 },
+      { kind: 'sync', since: new Date('2025-12-31T00:00:00.000Z') },
+    );
+    await done;
+    return one<any>('select * from import_jobs where id = $1', [id]);
+  };
+  const cached = async () => (await one<any>('select count(*)::int n from import_discovery_cache where workspace_id = $1', [admin.workspaceId])).n;
+
+  // Edited row listed by search, then deleted before its body is read: skipped, the job still completes.
+  const T3 = '2026-02-01T10:00:00.000Z';
+  (ws.pages as any)[IDS.r1] = { ...ws.pages[IDS.r1], last_edited_time: T3 };
+  const gone = await sync(withFailures((p) => (p.includes(IDS.r1) && p !== `/pages/${IDS.r1}` ? 404 : null)));
+  assert.equal(gone.status, 'done', gone.error);
+  assert.equal(gone.report.counts.vanished, 1, JSON.stringify(gone.report.counts));
+  assert.ok(gone.report.warnings.some((w: any) => w.kind === 'vanished' && w.notionId === IDS.r1));
+  assert.equal(await cached(), 0, 'cache cleared after a completed run');
+
+  // A run that fails after reading Sub page keeps its body; the retry reuses it instead of reading it again.
+  const T4 = '2026-02-02T10:00:00.000Z';
+  (ws.pages as any)[IDS.sub] = { ...ws.pages[IDS.sub], last_edited_time: T4 };
+  (ws.pages as any)[IDS.r1] = { ...ws.pages[IDS.r1], last_edited_time: T4 };
+  const failed = await sync(withFailures((p) => (p === `/blocks/${IDS.r1}/children` ? 401 : null)));
+  assert.equal(failed.status, 'failed');
+  assert.ok((await cached()) >= 1, 'bodies read before the failure are kept');
+  const retryFetch = withFailures(() => null);
+  const retry = await sync(retryFetch);
+  assert.equal(retry.status, 'done', retry.error);
+  assert.ok(retry.report.counts.cachedPages >= 1, JSON.stringify(retry.report.counts));
+  assert.ok(!retryFetch.calls.some((c: string) => c.includes(`/blocks/${IDS.sub}/children`) || c.includes(`/pages/${IDS.sub}/markdown`)), 'Sub page body not read again');
+  assert.equal(retry.report.counts.pages.updated, 1, JSON.stringify(retry.report.counts));
+  assert.ok(JSON.stringify(await blocksOf((await atriumId(IDS.sub))!)).length > 2, 'cached body was written');
+  assert.equal(await cached(), 0);
+});
+
 test('cancel stops a running import', async () => {
   const ws = buildWorkspace();
   const imp = new NotionImport({ token: 'x', targetTeamspaceId: tsId, peopleMode: 'text' }, admin, { fetchImpl: fakeNotionFetch(ws), fileImporter: fakeFiles as any, minIntervalMs: 0 });
