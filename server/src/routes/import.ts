@@ -64,6 +64,7 @@ export async function startNotionImport(admin: AuthUser, opts: ImportOptions, de
   beat.unref();
   const done = (async () => {
     try {
+      await imp.clearDiscoveryCache(14);
       if (kind === 'sync') {
         await imp.discoverChanges(mode.since ?? null);
         if (imp.order.length) {
@@ -82,6 +83,8 @@ export async function startNotionImport(admin: AuthUser, opts: ImportOptions, de
           imp.counts.relink = await relinkImported(admin.workspaceId, { userId: admin.id });
         }
       }
+      // Everything read was written, so later syncs skip it via import_mappings; the cache is only for resuming.
+      if (!opts.dryRun) await imp.clearDiscoveryCache();
       await setJob(id, { status: 'done', error: null, finished_at: new Date(), progress: { phase: 'done', done: 1, total: 1, counts: imp.counts }, report: imp.report(started) });
       if (kind === 'import' || imp.order.length || imp.counts.removed) {
         await audit({ workspaceId: admin.workspaceId, actorId: admin.id, action: kind === 'sync' ? 'import.notion_synced' : opts.dryRun ? 'import.notion_previewed' : 'import.notion_completed', targetType: 'import', targetId: id, meta: { counts: imp.counts, warnings: imp.warningCounts } });

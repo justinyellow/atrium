@@ -510,6 +510,17 @@ create table if not exists import_mappings (
 );
 create index if not exists import_mappings_atrium_idx on import_mappings(atrium_id);
 
+-- Page bodies read from Notion during discovery, kept until a run completes so an interrupted or failed
+-- import/sync resumes without re-reading pages that haven't changed since (keyed by Notion last_edited_time).
+create table if not exists import_discovery_cache (
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  source_id text not null,
+  last_edited timestamptz not null,
+  fetched_at timestamptz not null default now(),
+  body jsonb not null,
+  primary key (workspace_id, source_id)
+);
+
 -- Importer settings saved per workspace + source (e.g. the Notion teamspace map), pre-filled on the next run.
 create table if not exists import_settings (
   workspace_id uuid not null references workspaces(id) on delete cascade,

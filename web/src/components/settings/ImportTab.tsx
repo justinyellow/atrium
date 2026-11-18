@@ -14,6 +14,7 @@ const WARNING_LABELS: Record<string, string> = {
   file_failed: 'Files that could not be copied',
   block_rejected: 'Blocks that could not be converted (kept as a note)',
   fetch_failed: 'Items Notion would not return',
+  vanished: 'Items deleted or unshared in Notion while the import was running (skipped)',
   limit: 'Items left out because of the import limits',
   comments: 'Comments that could not be imported',
 };
@@ -51,6 +52,7 @@ const PHASES: Record<string, string> = {
   census: 'Converting (dry run)',
   checking: 'Checking Notion for changes',
   listing: 'Listing Notion pages',
+  rows: 'Reading database rows',
   done: 'Done',
 };
 
